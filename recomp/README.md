@@ -54,9 +54,40 @@ python recomp/run_tests.py --cc path/to/clang
 - Tests: 247/247 checks pass (memset/memcpy/strlen/memcmp/strncpy, 64-bit
   `__div2i`/`__mod2i`/`__shl2i`, `PSMTX*`, `PSVEC*`).
 
+## Boot harness (`boot/`, `build_boot.py`)
+
+Runs the translated `__start` on PC:
+
+```sh
+python recomp/build_boot.py --cc path/to/clang --run --timeout 30
+# needs orig/GEZE8P/sys/main.dol, the extracted sys/ (boot.bin, bi2.bin, fst.bin)
+# and the disc image (--sys / --iso to override the default paths)
+```
+
+- `boot_main.c` – sets up low memory like the IPL (disc ID, boot info, FST and
+  BI2 at the top of RAM), runs the entry point; a watchdog dumps the last guest
+  calls (with callers) if the game stops making progress.
+- `hle.txt` – guest functions replaced by native code (`hle_<Name>`):
+  - `hle_os.c`: OSReport/OSPanic, TRK/DB, DSP/AX bring-up, BAT setup.
+  - `hle_irq.c`: interrupt enable/disable + delivery of device interrupts to
+    the OS handler table.
+  - `hle_thread.c`: native scheduler — every guest thread is a Windows fiber
+    with its own CPU context; OS priority rules.
+  - `hle_time.c`: real-time time base, 59.94 Hz VI retrace interrupt.
+  - `hle_si.c`: controller bus (one neutral pad for now).
+  - `hle_dvd.c`: DVD interface backed by the disc image (+ DI interrupt).
+- `runtime/mmio.c` – hardware registers: EXI/SI instant transfers, ARAM
+  (16 MB) with its DMA engine and interrupt.
+
+Current state: OSInit, all SDK/CRI init, thread creation, main loop; the game
+reads its files from the disc and reaches the license screen
+(`k_boot.prd`, `egg01/02.mlt`, `bank06.mpb`, `amem_boot.nrc`, `k_license.prd`).
+
 ## Not done yet
 
-- Hardware registers (`0xCC00xxxx`) are not routed to device emulation.
+- Graphics: the GX FIFO (`0xCC008000`) is ignored — nothing is drawn yet.
+- Audio: AX runs without a DSP (silent); AI/ADX output not mixed.
+- Input: the pad is always neutral (SDL planned).
+- Alarms (`OSSetAlarm`) / decrementer are not emulated yet.
 - FPSCR rounding modes / exceptions are ignored.
 - `movie_module.rel` is not translated yet.
-- No native replacement (HLE) of SDK functions yet; no graphics/audio/input.

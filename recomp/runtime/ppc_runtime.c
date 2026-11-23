@@ -2,8 +2,10 @@
 // indirect calls through the generated function table, error handlers.
 #include "ppc_runtime.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 uint8_t* ppc_mem = NULL;
 
@@ -42,6 +44,55 @@ int ppc_load_dol(const char* path, uint32_t* entry) {
     return 1;
 }
 
+static void no_irq(int irq) { (void)irq; }
+void (*ppc_raise_irq)(int irq) = no_irq;
+
+volatile uint32_t ppc_trace_ring[1024];
+volatile uint32_t ppc_trace_lr[1024];
+volatile uint32_t ppc_trace_pos;
+
+const char* ppc_func_name(uint32_t addr) {
+    size_t lo = 0, hi = ppc_func_table_size;
+    while (lo < hi) {  // last entry with entry.addr <= addr
+        size_t mid = (lo + hi) / 2;
+        if (ppc_func_table[mid].addr <= addr) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo ? ppc_func_table[lo - 1].name : "?";
+}
+
+void ppc_dump_trace(int count) {
+    // Walk back through the ring, collapsing runs of the same function.
+    uint32_t pos = ppc_trace_pos;
+    uint32_t avail = pos < 1024 ? pos : 1024;
+    uint32_t addrs[64], lrs[64];
+    int reps[64], n = 0;
+    for (uint32_t i = 1; i <= avail && n < count && n < 64; i++) {
+        uint32_t a = ppc_trace_ring[(pos - i) & 1023u], lr = ppc_trace_lr[(pos - i) & 1023u];
+        if (n && addrs[n - 1] == a && lrs[n - 1] == lr) { reps[n - 1]++; continue; }
+        addrs[n] = a; lrs[n] = lr; reps[n] = 1; n++;
+    }
+    fprintf(stderr, "--- last guest calls (oldest first, repeats collapsed) ---\n");
+    for (int i = n - 1; i >= 0; i--) {
+        fprintf(stderr, "  %08X %-28s <- %08X %s", addrs[i], ppc_func_name(addrs[i]), lrs[i],
+                lrs[i] ? ppc_func_name(lrs[i]) : "");
+        if (reps[i] > 1) fprintf(stderr, "  x%d", reps[i]);
+        fprintf(stderr, "\n");
+    }
+}
+
+void ppc_fatal(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "ppc: fatal: ");
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+    ppc_dump_trace(24);
+    fflush(stderr);
+    exit(3);
+}
+
 PPCFunc ppc_lookup(uint32_t addr) {
     size_t lo = 0, hi = ppc_func_table_size;
     while (lo < hi) {
@@ -55,31 +106,33 @@ PPCFunc ppc_lookup(uint32_t addr) {
 
 void ppc_call_indirect(PPCContext* ctx, uint32_t addr) {
     PPCFunc fn = ppc_lookup(addr);
-    if (!fn) {
-        fprintf(stderr, "ppc: indirect call to unknown address %08X (lr=%08X)\n", addr, ctx->lr);
-        abort();
-    }
+    if (!fn) ppc_fatal("indirect call to unknown address %08X (lr=%08X)", addr, ctx->lr);
     fn(ctx);
 }
 
 void ppc_unimplemented(PPCContext* ctx, uint32_t addr, uint32_t ins) {
     (void)ctx;
-    fprintf(stderr, "ppc: unimplemented instruction %08X at %08X\n", ins, addr);
-    abort();
+    ppc_fatal("unimplemented instruction %08X at %08X (%s)", ins, addr, ppc_func_name(addr));
 }
 
 void ppc_missing(PPCContext* ctx, uint32_t addr) {
-    fprintf(stderr, "ppc: call to function %08X that was not recompiled (lr=%08X)\n", addr, ctx->lr);
-    abort();
+    ppc_fatal("call to function %08X that was not recompiled (lr=%08X)", addr, ctx->lr);
 }
 
 void ppc_syscall(PPCContext* ctx) {
-    fprintf(stderr, "ppc: sc at lr=%08X\n", ctx->lr);
+    // On GameCube `sc` is only used by PPCSync-style helpers; nothing to do.
+    if (getenv("PPC_LOG_SC")) fprintf(stderr, "ppc: sc at lr=%08X\n", ctx->lr);
 }
 
+// Gekko time base runs at bus clock / 4 = 40.5 MHz; derive it from host time.
 uint64_t ppc_get_timebase(void) {
-    static uint64_t tb = 0;
-    return tb += 1000;
+    static struct timespec t0;
+    static int init;
+    struct timespec now;
+    timespec_get(&now, TIME_UTC);
+    if (!init) { t0 = now; init = 1; }
+    uint64_t ns = (uint64_t)(now.tv_sec - t0.tv_sec) * 1000000000ull + (uint64_t)(now.tv_nsec - t0.tv_nsec);
+    return ns * 81 / 2000;  // 40.5 ticks per microsecond
 }
 
 void ppc_ctx_init(PPCContext* ctx) {

@@ -144,9 +144,7 @@ class Recompiler:
                 t = (sext(ins & 0xFFFC, 16) + (0 if ins & 2 else a)) & 0xFFFFFFFF
                 if fn.contains(t):
                     labels.add(t)
-        for jt_addr, targets in self.jumptables:
-            if targets and all(fn.contains(t) for t in targets):
-                labels.update(targets)
+        labels.update(self.jt_targets(fn))
         return labels
 
     def jt_targets(self, fn):
@@ -154,13 +152,46 @@ class Recompiler:
         for jt_addr, targets in self.jumptables:
             if targets and all(fn.contains(t) for t in targets):
                 out.extend(targets)
+        for a in range(fn.addr, fn.addr + fn.size, 4):
+            if self.dol.u32(a) == 0x4E800420:  # bctr
+                out.extend(self.find_switch_table(fn, a))
         return sorted(set(out))
+
+    def find_switch_table(self, fn, bctr_addr):
+        """Recognize `cmplwi rN,K; ... lis rX,T@ha; addi rX,rX,T@l; ... lwzx; mtctr; bctr`."""
+        hi = {}
+        table = None
+        count = None
+        start = max(fn.addr, bctr_addr - 4 * 24)
+        for a in range(start, bctr_addr, 4):
+            ins = self.dol.u32(a)
+            if ins is None:
+                continue
+            op, rd, ra = ins >> 26, (ins >> 21) & 31, (ins >> 16) & 31
+            if op == 15 and ra == 0:                       # lis rd, imm
+                hi[rd] = (ins & 0xFFFF) << 16
+            elif op == 14 and ra in hi:                    # addi rd, ra, imm
+                table = (hi[ra] + sext(ins & 0xFFFF, 16)) & 0xFFFFFFFF
+            elif op == 10:                                 # cmplwi crf, ra, K
+                count = (ins & 0xFFFF) + 1
+        if table is None:
+            return []
+        targets = []
+        for i in range(count or 512):
+            t = self.dol.u32(table + 4 * i)
+            if t is None or not fn.contains(t):
+                if count:
+                    return []  # inconsistent: don't guess
+                break
+            targets.append(t)
+        return targets
 
     def recompile(self, fn):
         labels = self.labels_for(fn)
         jt = self.jt_targets(fn)
         lines = [f"// {fn.name} @ {fn.addr:08X} size 0x{fn.size:X}",
-                 f"void {fn.cname}(PPCContext* ctx) {{"]
+                 f"void {fn.cname}(PPCContext* ctx) {{",
+                 f"  PPC_ENTER(0x{fn.addr:08X}u);"]
         last_ends = False
         for a in range(fn.addr, fn.addr + fn.size, 4):
             ins = self.dol.u32(a)
@@ -618,7 +649,7 @@ class Recompiler:
 
 
 def load_symbols(path):
-    funcs, jts = {}, []
+    funcs, jts, labels = {}, [], {}
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         m = SYM_RE.match(line)
         if not m:
@@ -627,9 +658,37 @@ def load_symbols(path):
         size = int(size, 16) if size else 0
         if typ == "function" and sec in (".init", ".text") and size:
             funcs[addr] = Func(name, addr, size)
+        elif typ == "label" and sec in (".init", ".text"):
+            labels[addr] = name
         elif typ == "object" and name.startswith("jumptable_"):
             jts.append((addr, size))
-    return funcs, jts
+    return funcs, jts, labels
+
+
+def add_mid_function_entries(dol, funcs, labels):
+    """`bl` targets inside another function (e.g. MWCC's _savegpr_27 inside
+    __save_gpr) get their own entry: a C function translating from that
+    address to the end of the containing function."""
+    starts = sorted(funcs)
+    import bisect
+    added = {}
+    for f in list(funcs.values()):
+        for a in range(f.addr, f.addr + f.size, 4):
+            ins = dol.u32(a)
+            if ins is None or ins >> 26 != 18 or not ins & 1:
+                continue
+            t = (sext(ins & 0x03FFFFFC, 26) + (0 if ins & 2 else a)) & 0xFFFFFFFF
+            if t in funcs or t in added:
+                continue
+            i = bisect.bisect_right(starts, t) - 1
+            if i < 0:
+                continue
+            parent = funcs[starts[i]]
+            if parent.contains(t):
+                name = labels.get(t, f"{parent.name}_{t:08X}")
+                added[t] = Func(name, t, parent.addr + parent.size - t)
+    funcs.update(added)
+    return len(added)
 
 
 def main():
@@ -641,10 +700,22 @@ def main():
     ap.add_argument("--chunk", type=int, default=400)
     ap.add_argument("--closure", action="store_true",
                     help="with --only, also recompile every function they (transitively) call")
+    ap.add_argument("--hle", type=Path,
+                    help="file with function names implemented natively by the runtime "
+                         "(one per line); they become calls to hle_<name>(ctx)")
     args = ap.parse_args()
+    hle_names = set()
+    if args.hle:
+        for line in args.hle.read_text(encoding="utf-8").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                hle_names.add(line)
 
     dol = Dol(args.dol)
-    funcs, jt_syms = load_symbols(args.symbols)
+    funcs, jt_syms, labels = load_symbols(args.symbols)
+    n_mid = add_mid_function_entries(dol, funcs, labels)
+    if n_mid:
+        print(f"added {n_mid} mid-function entry points")
     jumptables = []
     for addr, size in jt_syms:
         targets = [dol.u32(addr + 4 * i) for i in range(size // 4)]
@@ -674,7 +745,18 @@ def main():
     selected.sort(key=lambda f: f.addr)
 
     args.out.mkdir(parents=True, exist_ok=True)
-    bodies = [(f, rc.recompile(f)) for f in selected]
+    unknown_hle = hle_names - {f.name for f in funcs.values()}
+    if unknown_hle:
+        print(f"warning: HLE names not in symbols: {sorted(unknown_hle)}")
+
+    def body(f):
+        if f.name in hle_names:
+            return (f"// {f.name} @ {f.addr:08X}: native (HLE)\n"
+                    f"void hle_{f.name}(PPCContext* ctx);\n"
+                    f"void {f.cname}(PPCContext* ctx) {{ PPC_ENTER(0x{f.addr:08X}u); hle_{f.name}(ctx); }}")
+        return rc.recompile(f)
+
+    bodies = [(f, body(f)) for f in selected]
     generated = {f.addr for f in selected}
 
     hdr = ["// Generated by ppc2c.py from the game binary. Do not commit or distribute.",
@@ -701,7 +783,8 @@ def main():
         tbl.append(f"void ppc_{a:08X}(PPCContext* ctx) {{ ppc_missing(ctx, 0x{a:08X}u); }}")
     tbl.append("const PPCFuncEntry ppc_func_table[] = {")
     for a in sorted(generated | set(stubs)):
-        tbl.append(f"  {{ 0x{a:08X}u, ppc_{a:08X} }},")
+        cname = funcs[a].name.replace("\\", "\\\\").replace('"', '\\"')
+        tbl.append(f'  {{ 0x{a:08X}u, ppc_{a:08X}, "{cname}" }},')
     tbl.append("};")
     tbl.append(f"const size_t ppc_func_table_size = {len(generated | set(stubs))};")
     (args.out / "ppc_table.c").write_text("\n".join(tbl) + "\n", encoding="utf-8")

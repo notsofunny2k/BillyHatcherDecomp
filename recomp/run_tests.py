@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Recompile the functions used by recomp/tests, build the test binary with
 clang and run it against the original DOL.
 
@@ -26,7 +26,7 @@ def main():
     subprocess.run([sys.executable, str(ROOT / "recomp/ppc2c.py"), args.dol,
                     str(ROOT / "config/GEZE8P/symbols.txt"), str(out),
                     "--only", ",".join(FUNCS), "--closure"], check=True)
-    sources = sorted(out.glob("*.c")) + [ROOT / "recomp/runtime/ppc_runtime.c",
+    sources = sorted(out.glob("*.c")) + [ROOT / "recomp/runtime/ppc_runtime.c", ROOT / "recomp/runtime/mmio.c",
                                           ROOT / "recomp/tests/test_basic.c"]
     exe = out / "test_basic.exe"
     cmd = [args.cc, "-O2", "-std=c11", "-ffp-contract=off", "-fno-strict-aliasing",

@@ -1,0 +1,44 @@
+# Guest functions replaced by native code (hle_<Name> in recomp/boot/*.c)
+InitMetroTRK
+DBInit
+OSReport
+OSPanic
+__OSInitAudioSystem
+__OSStopAudioSystem
+__AI_SRC_INIT
+__DSP_boot_task
+__AXOutInitDSP
+RealMode
+# Interrupts (hle_irq.c)
+OSDisableInterrupts
+OSEnableInterrupts
+OSRestoreInterrupts
+# Threads: native scheduler on fibers (hle_thread.c)
+OSCreateThread
+OSResumeThread
+OSSuspendThread
+OSSleepThread
+OSWakeupThread
+OSExitThread
+OSCancelThread
+OSSetThreadPriority
+OSDisableScheduler
+OSEnableScheduler
+__OSReschedule
+SelectThread
+OSSaveContext
+OSLoadContext
+# SI: serial bus to the controllers (hle_si.c)
+SIBusy
+SIGetType
+SIGetTypeAsync
+SITransfer
+SIGetResponse
+SISetSamplingRate
+SIRefreshSamplingRate
+SIEnablePolling
+SISetXY
+SISetCommand
+SITransferCommands
+SIRegisterPollingHandler
+SIUnregisterPollingHandler

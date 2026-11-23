@@ -33,14 +33,48 @@ static inline uint32_t ppc_xlate(uint32_t a) {
 }
 static inline uint8_t* ppc_ptr(uint32_t a) { return ppc_mem + ppc_xlate(a); }
 
-static inline uint8_t ld8(uint32_t a) { return *ppc_ptr(a); }
-static inline uint16_t ld16(uint32_t a) { uint16_t v; memcpy(&v, ppc_ptr(a), 2); return __builtin_bswap16(v); }
-static inline uint32_t ld32(uint32_t a) { uint32_t v; memcpy(&v, ppc_ptr(a), 4); return __builtin_bswap32(v); }
+// Hardware registers (0xCC00xxxx) go to the runtime's device layer.
+uint32_t ppc_mmio_read(uint32_t a, int size);
+void ppc_mmio_write(uint32_t a, uint32_t v, int size);
+#define PPC_IS_MMIO(a) __builtin_expect(((a) >> 24) == 0xCC, 0)
+
+static inline uint8_t ld8(uint32_t a) {
+    if (PPC_IS_MMIO(a)) return (uint8_t)ppc_mmio_read(a, 1);
+    return *ppc_ptr(a);
+}
+static inline uint16_t ld16(uint32_t a) {
+    if (PPC_IS_MMIO(a)) return (uint16_t)ppc_mmio_read(a, 2);
+    uint16_t v; memcpy(&v, ppc_ptr(a), 2); return __builtin_bswap16(v);
+}
+static inline uint32_t ld32(uint32_t a) {
+    if (PPC_IS_MMIO(a)) return ppc_mmio_read(a, 4);
+    uint32_t v; memcpy(&v, ppc_ptr(a), 4); return __builtin_bswap32(v);
+}
 static inline uint64_t ld64(uint32_t a) { uint64_t v; memcpy(&v, ppc_ptr(a), 8); return __builtin_bswap64(v); }
-static inline void st8(uint32_t a, uint8_t v) { *ppc_ptr(a) = v; }
-static inline void st16(uint32_t a, uint16_t v) { v = __builtin_bswap16(v); memcpy(ppc_ptr(a), &v, 2); }
-static inline void st32(uint32_t a, uint32_t v) { v = __builtin_bswap32(v); memcpy(ppc_ptr(a), &v, 4); }
+static inline void st8(uint32_t a, uint8_t v) {
+    if (PPC_IS_MMIO(a)) { ppc_mmio_write(a, v, 1); return; }
+    *ppc_ptr(a) = v;
+}
+static inline void st16(uint32_t a, uint16_t v) {
+    if (PPC_IS_MMIO(a)) { ppc_mmio_write(a, v, 2); return; }
+    v = __builtin_bswap16(v); memcpy(ppc_ptr(a), &v, 2);
+}
+static inline void st32(uint32_t a, uint32_t v) {
+    if (PPC_IS_MMIO(a)) { ppc_mmio_write(a, v, 4); return; }
+    v = __builtin_bswap32(v); memcpy(ppc_ptr(a), &v, 4);
+}
 static inline void st64(uint32_t a, uint64_t v) { v = __builtin_bswap64(v); memcpy(ppc_ptr(a), &v, 8); }
+
+// Call trace ring buffer (last entered guest functions), for diagnostics.
+extern volatile uint32_t ppc_trace_ring[1024];
+extern volatile uint32_t ppc_trace_lr[1024];
+extern volatile uint32_t ppc_trace_pos;
+#define PPC_ENTER(a)                                    \
+    do {                                                \
+        uint32_t ppc_tp_ = ppc_trace_pos++ & 1023u;     \
+        ppc_trace_ring[ppc_tp_] = (a);                  \
+        ppc_trace_lr[ppc_tp_] = ctx->lr;                \
+    } while (0)
 
 static inline float u2f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 static inline uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
