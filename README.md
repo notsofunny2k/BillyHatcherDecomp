@@ -46,11 +46,13 @@ Project status
 
 - Initial analysis done: 15 559 functions in `main.dol`, 767 in `movie_module.rel`.
 - Libraries identified: Dolphin SDK (April 2003 build), CRI ADX (ADXT/ADXF/ADXB, SJ, LSC, CVFS), CRI Sofdec (in `movie_module.rel`), Sonic Team Ninja engine (`gj*`).
-- Named functions: 853 / 15 559 in `main.dol`, 53 / 767 in `movie_module.rel`.
+- Named functions: 904 / 15 559 in `main.dol`, 53 / 767 in `movie_module.rel`.
 - Function naming helpers in `tools/`:
   - `name_from_strings.py` – names functions from the error/assert strings they reference.
   - `name_sdk_anchors.py` – names SDK init functions from `<< Dolphin SDK - XX >>` version strings.
   - `build_sdk_ref.py` + `match_ref_objects.py` – compile [dolsdk2004](https://github.com/doldecomp/dolsdk2004) with MWCC and match its functions byte-for-byte (relocations masked) against `main.dol`, then follow `bl` targets of matched functions.
+
+  - `build_ref_objects.py` – compile a source list from another decomp project (only its sources are compiled, none of its scripts run); used with [sms](https://github.com/doldecomp/sms) for MSL_C, Runtime and MetroTRK.
 
   ```sh
   python tools/build_sdk_ref.py <path/to/dolsdk2004> build/compilers/GC/1.2.5n build/sdkref
