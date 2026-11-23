@@ -1,4 +1,4 @@
-# Static recompiler (Gekko → C)
+﻿# Static recompiler (Gekko â†’ C)
 
 Goal: a native PC executable built from the user's own copy of the game.
 `ppc2c.py` translates every function of `main.dol` to C; a runtime replaces the
@@ -11,19 +11,19 @@ contains the recompiler, the runtime and tests.
 
 ## Layout
 
-- `ppc2c.py` – recompiler. Uses `config/GEZE8P/symbols.txt` for function
+- `ppc2c.py` â€“ recompiler. Uses `config/GEZE8P/symbols.txt` for function
   boundaries/names and `jumptable_*` objects for `switch` targets.
-- `runtime/ppc_context.h` – CPU state (GPRs, FPRs + paired singles, CR, XER,
+- `runtime/ppc_context.h` â€“ CPU state (GPRs, FPRs + paired singles, CR, XER,
   SPRs/GQRs) and big-endian guest memory helpers.
-- `runtime/ppc_runtime.c` – guest memory, DOL loader, indirect calls through the
+- `runtime/ppc_runtime.c` â€“ guest memory, DOL loader, indirect calls through the
   generated function table, error handlers.
-- `tests/test_basic.c` + `run_tests.py` – runs translated functions on known
+- `tests/test_basic.c` + `run_tests.py` â€“ runs translated functions on known
   inputs and checks the results against native C.
 
 ## Usage
 
 ```sh
-# translate everything (≈5 s, ≈45 MB of C)
+# translate everything (â‰ˆ5 s, â‰ˆ45 MB of C)
 python recomp/ppc2c.py orig/GEZE8P/sys/main.dol config/GEZE8P/symbols.txt build/recomp_all
 
 # translate a few functions plus everything they call
@@ -36,9 +36,9 @@ python recomp/run_tests.py --cc path/to/clang
 ## Translation model
 
 - One C function per guest function: `void ppc_XXXXXXXX(PPCContext* ctx)`.
-- Branches inside a function → `goto`; `bl` → direct C call (sets `lr`);
-  `blr` → `return`; branches to another function → tail call.
-- `bctr` → `switch` over the function's jump-table targets, otherwise an
+- Branches inside a function â†’ `goto`; `bl` â†’ direct C call (sets `lr`);
+  `blr` â†’ `return`; branches to another function â†’ tail call.
+- `bctr` â†’ `switch` over the function's jump-table targets, otherwise an
   indirect call through the sorted function table.
 - Single-precision ops and paired singles round through `float`; `fmadd`-family
   ops use `fma()` (fused, as on Gekko). `psq_l`/`psq_st` honour GQR
@@ -64,19 +64,19 @@ python recomp/build_boot.py --cc path/to/clang --run --timeout 30
 # and the disc image (--sys / --iso to override the default paths)
 ```
 
-- `boot_main.c` – sets up low memory like the IPL (disc ID, boot info, FST and
+- `boot_main.c` â€“ sets up low memory like the IPL (disc ID, boot info, FST and
   BI2 at the top of RAM), runs the entry point; a watchdog dumps the last guest
   calls (with callers) if the game stops making progress.
-- `hle.txt` – guest functions replaced by native code (`hle_<Name>`):
+- `hle.txt` â€“ guest functions replaced by native code (`hle_<Name>`):
   - `hle_os.c`: OSReport/OSPanic, TRK/DB, DSP/AX bring-up, BAT setup.
   - `hle_irq.c`: interrupt enable/disable + delivery of device interrupts to
     the OS handler table.
-  - `hle_thread.c`: native scheduler — every guest thread is a Windows fiber
+  - `hle_thread.c`: native scheduler â€” every guest thread is a Windows fiber
     with its own CPU context; OS priority rules.
   - `hle_time.c`: real-time time base, 59.94 Hz VI retrace interrupt.
   - `hle_si.c`: controller bus (one neutral pad for now).
   - `hle_dvd.c`: DVD interface backed by the disc image (+ DI interrupt).
-- `runtime/mmio.c` – hardware registers: EXI/SI instant transfers, ARAM
+- `runtime/mmio.c` â€“ hardware registers: EXI/SI instant transfers, ARAM
   (16 MB) with its DMA engine and interrupt.
 
 Current state: OSInit, all SDK/CRI init, thread creation, main loop; the game
@@ -85,23 +85,26 @@ reads its files from the disc and reaches the license screen
 
 ### Graphics (`boot/gx/`)
 
-- `gx.c` – command processor for the write-gather pipe stream: CP/XF/BP
+- `gx.c` â€“ command processor for the write-gather pipe stream: CP/XF/BP
   registers, indexed XF loads, display lists, primitives with every vertex
   format (direct/indexed, all component/color types), position matrices +
   projection, viewport, blending/depth, TLUT loads, EFB copy to XFB = present,
   PE draw-done/token interrupts.
-- `gx_tex.c` – texture decoding: I4, I8, IA4, IA8, RGB565, RGB5A3, RGBA8,
+- `gx_tex.c` â€“ texture decoding: I4, I8, IA4, IA8, RGB565, RGB5A3, RGBA8,
   C4, C8, C14X2 (TLUT), CMPR; cached GL textures.
-- `gx_win.c` – Win32 window + OpenGL (legacy pipeline for this first version);
+- `gx_win.c` â€“ Win32 window + OpenGL (legacy pipeline for this first version);
   `GX_SCREENSHOT_DIR=<dir>` saves a frame every second for debugging.
 
-- `gx_shader.c` – TEV as generated GLSL (cached per configuration): up to 16
+- `gx_shader.c` â€“ TEV as generated GLSL (cached per configuration): up to 16
   stages, all color/alpha inputs, konst colors and registers, bias/scale/
   subtract/clamp, swap tables, alpha test.
 - Per-vertex on the CPU: position/normal matrices, lighting channels
   (material/ambient sources, up to 8 lights, spot + distance attenuation),
   texgen with texture matrices (ST/STQ, position/normal/texcoord sources).
-- Vertices are submitted as arrays; texture hashes are checked once per frame.
+- Draws are batched: consecutive draws with the same render state become one
+  triangle list, submitted when BP state / viewport changes or on copies and
+  syncs (title screen: ~5000 draws per frame in ~250 batches).
+- Texture hashes are checked once per frame. `GX_FPS=1` prints fps every 5 s.
 
 Not yet: fog, indirect textures, specular lights, dual-tex (post) matrices,
 scissor, TEV compare modes, render-to-texture (EFB copies to RAM).

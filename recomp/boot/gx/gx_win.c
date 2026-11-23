@@ -40,9 +40,12 @@ int gx_win_open(void) {
                          CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL,
                          wc.hInstance, NULL);
     if (!hwnd) return 0;
-    // GX_WINDOW=background: start minimized without stealing focus (automated runs)
+    // GX_WINDOW=background: minimized, no focus; GX_WINDOW=noactivate: visible, no focus
     const char* mode = getenv("GX_WINDOW");
-    ShowWindow(hwnd, (mode && !strcmp(mode, "background")) ? SW_SHOWMINNOACTIVE : SW_SHOW);
+    int show = SW_SHOW;
+    if (mode && !strcmp(mode, "background")) show = SW_SHOWMINNOACTIVE;
+    if (mode && !strcmp(mode, "noactivate")) show = SW_SHOWNOACTIVATE;
+    ShowWindow(hwnd, show);
     hdc = GetDC(hwnd);
     PIXELFORMATDESCRIPTOR pfd = {sizeof(pfd), 1, PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
                                  PFD_TYPE_RGBA, 32, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 24, 8, 0,

@@ -400,26 +400,18 @@ static void tev_reg_write(uint32_t reg, uint32_t val) {
     else { dst[n * 4 + 2] = a / 255.f; dst[n * 4 + 1] = b / 255.f; }     // BG
 }
 
-#define MAX_DRAW_VERTS 65536
-static float a_pos[MAX_DRAW_VERTS * 4], a_col[2][MAX_DRAW_VERTS * 4], a_tex[8][MAX_DRAW_VERTS * 3];
+// ---- batching -------------------------------------------------------------
+// Consecutive draws with the same render state are converted to triangles and
+// accumulated; the batch is submitted only when render state changes (BP
+// registers, viewport), on EFB copies / syncs, or when it is full. Matrices,
+// lighting and vertex formats are applied on the CPU, so they don't break it.
+#define MAX_BATCH 196608
+static float a_pos[MAX_BATCH * 4], a_col[2][MAX_BATCH * 4], a_tex[8][MAX_BATCH * 3];
+static int batch_n;
+static unsigned long long batches;
 
-static void draw(int prim, int vat, int count, const uint8_t* data) {
-    VtxFmt f;
-    get_fmt(vat, &f);
-    static const GLenum mode[8] = {GL_QUADS, GL_QUADS, GL_TRIANGLES, GL_TRIANGLE_STRIP,
-                                   GL_TRIANGLE_FAN, GL_LINES, GL_LINE_STRIP, GL_POINTS};
-    if (count > MAX_DRAW_VERTS) count = MAX_DRAW_VERTS;
-    long long t0 = qpc();
-    for (int i = 0; i < count; i++) {
-        Vtx v;
-        OutVtx o;
-        data = decode_vertex(data, &f, &v);
-        process_vertex(&v, &o);
-        memcpy(&a_pos[i * 4], o.pos, 16);
-        memcpy(&a_col[0][i * 4], o.col[0], 16);
-        memcpy(&a_col[1][i * 4], o.col[1], 16);
-        for (int t = 0; t < 8; t++) memcpy(&a_tex[t][i * 3], o.tex[t], 12);
-    }
+static void gx_flush(void) {
+    if (!batch_n) return;
     long long t1 = qpc();
     apply_viewport();
     apply_blend_depth();
@@ -431,11 +423,88 @@ static void draw(int prim, int vat, int count, const uint8_t* data) {
     gx_gl_attrib(2, 4, a_col[1]);
     for (int t = 0; t < 8; t++) gx_gl_attrib(3 + t, 3, a_tex[t]);
     long long t2 = qpc();
-    glDrawArrays(mode[prim], 0, count);
+    glDrawArrays(GL_TRIANGLES, 0, batch_n);
     long long t3 = qpc();
-    t_decode += t1 - t0; t_state += t2 - t1; t_draw += t3 - t2;
+    t_state += t2 - t1;
+    t_draw += t3 - t2;
+    batch_n = 0;
+    batches++;
+}
+
+static void put_vertex(const OutVtx* o) {
+    int i = batch_n++;
+    memcpy(&a_pos[i * 4], o->pos, 16);
+    memcpy(&a_col[0][i * 4], o->col[0], 16);
+    memcpy(&a_col[1][i * 4], o->col[1], 16);
+    for (int t = 0; t < 8; t++) memcpy(&a_tex[t][i * 3], o->tex[t], 12);
+}
+
+#define MAX_DRAW_VERTS 65536
+static OutVtx tmp_v[MAX_DRAW_VERTS];
+
+// Lines and points (rare): drawn immediately with the same state.
+static void draw_direct(GLenum mode, int count) {
+    gx_flush();
+    for (int i = 0; i < count; i++) put_vertex(&tmp_v[i]);
+    apply_viewport();
+    apply_blend_depth();
+    bind_textures();
+    uint32_t ac = bp[0xF3];
+    gx_shader_bind(bp, tev_konst, tev_reg, (ac & 255) / 255.f, ((ac >> 8) & 255) / 255.f);
+    gx_gl_attrib(0, 4, a_pos);
+    gx_gl_attrib(1, 4, a_col[0]);
+    gx_gl_attrib(2, 4, a_col[1]);
+    for (int t = 0; t < 8; t++) gx_gl_attrib(3 + t, 3, a_tex[t]);
+    glDrawArrays(mode, 0, batch_n);
+    batch_n = 0;
+}
+
+static void draw(int prim, int vat, int count, const uint8_t* data) {
+    VtxFmt f;
+    get_fmt(vat, &f);
+    if (count > MAX_DRAW_VERTS) count = MAX_DRAW_VERTS;
+    long long t0 = qpc();
+    for (int i = 0; i < count; i++) {
+        Vtx v;
+        data = decode_vertex(data, &f, &v);
+        process_vertex(&v, &tmp_v[i]);
+    }
+    t_decode += qpc() - t0;
     st.draws++;
     st.verts += (unsigned long long)count;
+
+    if (prim >= 5) {  // lines, line strip, points
+        static const GLenum mode[8] = {0, 0, 0, 0, 0, GL_LINES, GL_LINE_STRIP, GL_POINTS};
+        draw_direct(mode[prim], count);
+        return;
+    }
+    int tris = prim <= 1 ? (count / 4) * 2 : prim == 2 ? count / 3 : (count >= 3 ? count - 2 : 0);
+    if (batch_n + tris * 3 > MAX_BATCH) gx_flush();
+    switch (prim) {
+    case 0: case 1:  // quads
+        for (int i = 0; i + 3 < count; i += 4) {
+            put_vertex(&tmp_v[i]); put_vertex(&tmp_v[i + 1]); put_vertex(&tmp_v[i + 2]);
+            put_vertex(&tmp_v[i]); put_vertex(&tmp_v[i + 2]); put_vertex(&tmp_v[i + 3]);
+        }
+        break;
+    case 2:  // triangles
+        for (int i = 0; i + 2 < count; i += 3) {
+            put_vertex(&tmp_v[i]); put_vertex(&tmp_v[i + 1]); put_vertex(&tmp_v[i + 2]);
+        }
+        break;
+    case 3:  // triangle strip
+        for (int i = 2; i < count; i++) {
+            if (i & 1) { put_vertex(&tmp_v[i - 1]); put_vertex(&tmp_v[i - 2]); }
+            else { put_vertex(&tmp_v[i - 2]); put_vertex(&tmp_v[i - 1]); }
+            put_vertex(&tmp_v[i]);
+        }
+        break;
+    case 4:  // triangle fan
+        for (int i = 2; i < count; i++) {
+            put_vertex(&tmp_v[0]); put_vertex(&tmp_v[i - 1]); put_vertex(&tmp_v[i]);
+        }
+        break;
+    }
 }
 
 // ---------------------------------------------------- BP side effects
@@ -447,7 +516,10 @@ static void bp_write(uint32_t v) {
     if (reg == 0xFE) { bp[0xFE] = val; return; }
     uint32_t mask = bp[0xFE] ? bp[0xFE] : 0xFFFFFF;
     bp[0xFE] = 0;
-    bp[reg] = (bp[reg] & ~mask) | (val & mask);
+    uint32_t nv = (bp[reg] & ~mask) | (val & mask);
+    // anything that changes render state, syncs or copies ends the batch
+    if (nv != bp[reg] || reg == 0x45 || reg == 0x47 || reg == 0x48 || reg == 0x52 || reg == 0x65) gx_flush();
+    bp[reg] = nv;
     switch (reg) {
     case 0x45: pe_raise(1, 0); break;                        // draw done
     case 0x47: pe_raise(0, (uint16_t)(val & 0xFFFF)); break;  // token (no irq)
@@ -458,6 +530,25 @@ static void bp_write(uint32_t v) {
             st.frames++;
             if (!st.t_first) st.t_first = GetTickCount64();
             st.t_last = GetTickCount64();
+            {  // GX_FPS=1: fps and time split every 5 s
+                static unsigned long long win_t, win_f;
+                static long long win_dec, win_state, win_draw;
+                static int fps_on = -1;
+                if (fps_on < 0) fps_on = getenv("GX_FPS") != NULL;
+                if (fps_on) {
+                    if (!win_t) { win_t = st.t_last; win_f = st.frames; }
+                    if (st.t_last - win_t >= 5000) {
+                        QueryPerformanceFrequency(&qpf);
+                        double sec = (st.t_last - win_t) / 1000.0, f = (double)qpf.QuadPart;
+                        fprintf(stderr, "fps %.1f | per frame: vertices %.2f ms, state %.2f ms, draw %.2f ms\n",
+                                (st.frames - win_f) / sec, (t_decode - win_dec) / f * 1000.0 / (st.frames - win_f),
+                                (t_state - win_state) / f * 1000.0 / (st.frames - win_f),
+                                (t_draw - win_draw) / f * 1000.0 / (st.frames - win_f));
+                        win_t = st.t_last; win_f = st.frames;
+                        win_dec = t_decode; win_state = t_state; win_draw = t_draw;
+                    }
+                }
+            }
             static int shot;
             char* dir = getenv("GX_SCREENSHOT_DIR");
             if (dir && (st.frames % 60 == 0) && shot < 20) {
@@ -516,8 +607,12 @@ static void pe_raise(int kind, uint16_t token) {
 
 // ------------------------------------------------------ command parser
 static void xf_load(uint32_t addr, uint32_t n, const uint8_t* p) {
-    for (uint32_t i = 0; i < n; i++)
-        if (addr + i < 0x1100) xf_mem[addr + i] = rd32(p + 4 * i);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t a = addr + i, v = rd32(p + 4 * i);
+        if (a >= 0x1100) continue;
+        if (a >= 0x101A && a <= 0x101F && xf_mem[a] != v) gx_flush();  // viewport is GL state
+        xf_mem[a] = v;
+    }
 }
 
 static void run_list(const uint8_t* p, size_t len);
@@ -639,6 +734,6 @@ void gx_stats(void) {
     QueryPerformanceFrequency(&qpf);
     fprintf(stderr, "gx: time in vertex processing %.1f s, state/shader/textures %.1f s, glDrawArrays %.1f s\n",
             (double)t_decode / qpf.QuadPart, (double)t_state / qpf.QuadPart, (double)t_draw / qpf.QuadPart);
-    fprintf(stderr, "gx: %llu commands, %llu draws, %llu vertices, %llu frames, %llu unknown bytes, %d shaders\n",
-            st.cmds, st.draws, st.verts, st.frames, st.unknown, gx_shader_count());
+    fprintf(stderr, "gx: %llu commands, %llu draws in %llu batches, %llu vertices, %llu frames, %llu unknown bytes, %d shaders\n",
+            st.cmds, st.draws, batches, st.verts, st.frames, st.unknown, gx_shader_count());
 }
