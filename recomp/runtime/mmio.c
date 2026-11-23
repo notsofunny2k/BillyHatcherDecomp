@@ -100,9 +100,9 @@ static uint32_t complete_transfers(uint32_t off, uint32_t v) {
 
 void ppc_mmio_write(uint32_t a, uint32_t v, int size) {
     uint32_t off = a & 0xFFFF;
-    if ((off >> 12) == 0x8) return;  // GX FIFO: ignored until graphics exist
+    if (ppc_mmio_write_hook && ppc_mmio_write_hook(off, v, size)) return;  // devices (DVD, GX FIFO...)
+    if ((off >> 12) == 0x8) return;  // GX FIFO without a graphics backend: dropped
     note(a, size, 1, v);
-    if (ppc_mmio_write_hook && ppc_mmio_write_hook(off, v, size)) return;
     if (size == 4) v = complete_transfers(off, v);
     if (off == 0x500A && size == 2) { write_dsp_csr((uint16_t)v); return; }
     if (off == 0x5008 && size == 4) {  // 32-bit write covering the CSR's low half

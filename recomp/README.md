@@ -83,9 +83,29 @@ Current state: OSInit, all SDK/CRI init, thread creation, main loop; the game
 reads its files from the disc and reaches the license screen
 (`k_boot.prd`, `egg01/02.mlt`, `bank06.mpb`, `amem_boot.nrc`, `k_license.prd`).
 
+### Graphics (`boot/gx/`)
+
+- `gx.c` – command processor for the write-gather pipe stream: CP/XF/BP
+  registers, indexed XF loads, display lists, primitives with every vertex
+  format (direct/indexed, all component/color types), position matrices +
+  projection, viewport, blending/depth, TLUT loads, EFB copy to XFB = present,
+  PE draw-done/token interrupts.
+- `gx_tex.c` – texture decoding: I4, I8, IA4, IA8, RGB565, RGB5A3, RGBA8,
+  C4, C8, C14X2 (TLUT), CMPR; cached GL textures.
+- `gx_win.c` – Win32 window + OpenGL (legacy pipeline for this first version);
+  `GX_SCREENSHOT_DIR=<dir>` saves a frame every second for debugging.
+
+Approximations: TEV is "vertex/material color × texture 0"; no lighting,
+texgen matrices, indirect textures, fog, scissor or render-to-texture yet.
+
+Current state: boot logos render correctly; the game reaches the title,
+where it links a REL module at runtime (not translated yet).
+
 ## Not done yet
 
-- Graphics: the GX FIFO (`0xCC008000`) is ignored — nothing is drawn yet.
+- RELs loaded at runtime (`OSLink`): `movie_module.rel` must be translated
+  with its relocations resolved against the load address.
+- Full TEV / lighting / render-to-texture.
 - Audio: AX runs without a DSP (silent); AI/ADX output not mixed.
 - Input: the pad is always neutral (SDL planned).
 - Alarms (`OSSetAlarm`) / decrementer are not emulated yet.

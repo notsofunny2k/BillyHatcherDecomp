@@ -1,4 +1,4 @@
-// Boot harness: prepares guest memory like the GameCube IPL/apploader would,
+﻿// Boot harness: prepares guest memory like the GameCube IPL/apploader would,
 // then runs the translated entry point (__start).
 //
 // Usage: boot.exe <main.dol> <extracted sys dir> [timeout_seconds]
@@ -8,8 +8,10 @@
 
 #include <windows.h>
 
+#include "gx/gx_internal.h"
 #include "hle_dvd.h"
 #include "hle_irq.h"
+void hle_thread_dump(void);
 #include "ppc_funcs.h"
 #include "ppc_runtime.h"
 
@@ -83,14 +85,14 @@ static DWORD WINAPI watchdog(LPVOID arg) {
         if (still >= 3) {
             fprintf(stderr, "boot: no new guest calls for 3 s (stuck in a loop?)\n");
             ppc_dump_trace(32);
-            hle_dvd_stats();
+            hle_dvd_stats(); gx_stats(); hle_thread_dump();
             fflush(stderr);
             ExitProcess(4);
         }
         if (elapsed >= g_timeout) {
             fprintf(stderr, "boot: timeout after %d s (guest still running)\n", elapsed);
             ppc_dump_trace(32);
-            hle_dvd_stats();
+            hle_dvd_stats(); gx_stats(); hle_thread_dump();
             fflush(stderr);
             ExitProcess(5);
         }
@@ -109,6 +111,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     hle_dvd_install();
+    gx_install();  // chains after the DVD hooks
     uint32_t entry = 0;
     if (!ppc_mem_init() || !ppc_load_dol(argv[1], &entry)) {
         fprintf(stderr, "boot: could not load %s\n", argv[1]);
