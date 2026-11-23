@@ -130,9 +130,12 @@ static void mix_voice(uint32_t pb, int* L, int* R) {
     for (int n = 0; n < SAMPLES; n++) {
         // linear interpolation between the two newest source samples
         int s = last[2] + (int)(((int64_t)(last[3] - last[2]) * (int64_t)frac) >> 16);
-        s = (s * vol) >> 15;
-        L[n] += (s * vl) >> 15;
-        R[n] += (s * vr) >> 15;
+        // envelope then bus volumes (1.15 fixed point); 64-bit to avoid overflow
+        int64_t e = ((int64_t)s * vol) >> 15;
+        if (e > 32767) e = 32767;
+        if (e < -32768) e = -32768;
+        L[n] += (int)((e * vl) >> 15);
+        R[n] += (int)((e * vr) >> 15);
         vol += dvol; if (vol < 0) vol = 0; if (vol > 0xFFFF) vol = 0xFFFF;
         vl += dvl; if (vl < 0) vl = 0; if (vl > 0xFFFF) vl = 0xFFFF;
         vr += dvr; if (vr < 0) vr = 0; if (vr > 0xFFFF) vr = 0xFFFF;
@@ -151,9 +154,10 @@ static void mix_voice(uint32_t pb, int* L, int* R) {
     st16(pb + PB_YN2, (uint16_t)v.yn2);
     st16(pb + PB_FRAC, (uint16_t)frac);
     for (int i = 0; i < 4; i++) st16(pb + PB_LAST + 2 * i, (uint16_t)last[i]);
-    st16(pb + PB_VE_VOL, (uint16_t)vol);
-    st16(pb + PB_VL, (uint16_t)vl);
-    st16(pb + PB_VR, (uint16_t)vr);
+    st16(pb + PB_VE_VOL, (uint16_t)vol);  // AX reads the envelope volume back
+    // Bus volumes are not written back: AX re-sends them (with their ramp)
+    // whenever they change; writing the ramped value would make it run away.
+    (void)vl; (void)vr;
     if (!v.running) st16(pb + PB_STATE, 0);
     voices_mixed++;
 }
@@ -180,15 +184,24 @@ static void mix_frame(void) {
     frames++;
 }
 
-// AI DMA finished a 5 ms block: AX builds the next frame, the "DSP" mixes it.
+static int pending_frames;  // AX frames requested but not produced yet
+
+// AI DMA finished: AX builds the next frame(s), the "DSP" mixes them.
+// Several requested frames can be served by one interrupt.
 void hle___AXOutAiCallback(PPCContext* ctx) {
     uint32_t saved_lr = ctx->lr, saved_r3 = ctx->r[3];
-    ctx->r[3] = 0;
-    ctx->lr = 0;
-    ppc_call_indirect(ctx, AX_OUT_NEW_FRAME);
+    int n = pending_frames;
+    if (n < 1) n = 1;
+    if (n > 8) n = 8;
+    pending_frames = 0;
+    for (int i = 0; i < n; i++) {
+        ctx->r[3] = 0;
+        ctx->lr = 0;
+        ppc_call_indirect(ctx, AX_OUT_NEW_FRAME);
+        mix_frame();
+    }
     ctx->lr = saved_lr;
     ctx->r[3] = saved_r3;
-    mix_frame();
 }
 
 void ax_mix_stats(void) {
@@ -197,14 +210,21 @@ void ax_mix_stats(void) {
     audio_out_stats();
 }
 
-// 5 ms tick: raise the AI DMA interrupt (DSP CSR AIDINT) if it's unmasked.
-void audio_tick(void) {
+#define TARGET_BUFFERED (SAMPLES * 16)  // ~80 ms queued in the sound card
+
+void audio_pump(int wallclock_due) {
     uint16_t csr = ppc_mmio_get16(0x500A);
-    static int logged;
-    if (getenv("AX_DEBUG") && logged++ < 5)
-        fprintf(stderr, "ax: tick csr=%04X handler5=%08X mask=%08X/%08X\n", csr, ld32(0x80003040u + 20),
-                ld32(0x800000C4u), ld32(0x800000C8u));
-    // DSP CSR: 0x08 = AIDINT (AI DMA done), 0x10 = AIDINTMSK (enabled)
+    if (!(csr & 0x10)) return;  // AIDINTMSK: AX not running yet
+    int need;
+    int buffered = audio_out_buffered();
+    if (buffered < 0 || frames < 8) {
+        need = wallclock_due;  // no device (or warming up): follow the wall clock
+    } else {
+        need = (TARGET_BUFFERED - buffered) / SAMPLES - pending_frames;
+    }
+    if (need <= 0) return;
+    pending_frames += need;
+    // DSP CSR: 0x08 = AIDINT (AI DMA done), raise __OS_INTERRUPT_DSP_AI
     ppc_mmio_set16(0x500A, (uint16_t)(csr | 0x08));
-    if (csr & 0x10) hle_irq_raise(IRQ_DSP_AI);
+    hle_irq_raise(IRQ_DSP_AI);
 }

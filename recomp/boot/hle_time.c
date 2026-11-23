@@ -33,11 +33,13 @@ void hle_time_poll(void) {
         if (next_vi < now) next_vi = now + VI_PERIOD;  // fell behind: don't burst
         raise_retrace();
     }
-    if (now >= next_ai) {
+    int due = 0;
+    while (now >= next_ai && due < 8) {
         next_ai += AI_PERIOD;
-        if (next_ai + 4 * AI_PERIOD < now) next_ai = now + AI_PERIOD;
-        audio_tick();
+        due++;
     }
+    if (now >= next_ai) next_ai = now + AI_PERIOD;  // far behind: resync
+    audio_pump(due);
 }
 
 // Nothing can run: wait for the next timed event and raise it.

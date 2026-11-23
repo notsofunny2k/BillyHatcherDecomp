@@ -77,6 +77,12 @@ void audio_out_push(const short* stereo, int samples) {
     }
 }
 
+// Samples written but not yet played (-1 if there is no device).
+int audio_out_buffered(void) {
+    if (!opened) return failed ? -1 : 0;
+    return queued() * BLOCK_SAMPLES + fill_pos;
+}
+
 void audio_out_stats(void) {
     fprintf(stderr, "audio: %llu AX frames mixed, %llu blocks dropped\n", frames_out, blocks_dropped);
 }
