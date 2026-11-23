@@ -59,6 +59,11 @@ Project status
   python tools/match_ref_objects.py build/sdkref orig/GEZE8P/sys/main.dol config/GEZE8P/symbols.txt --apply
   ```
 
+PC port (static recompilation)
+==============================
+
+See [`recomp/README.md`](recomp/README.md). `recomp/ppc2c.py` translates all of `main.dol` to C; the generated code stays in `build/` and is never committed.
+
 Ghidra
 ======
 
