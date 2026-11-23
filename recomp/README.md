@@ -98,6 +98,23 @@ reads its files from the disc and reaches the license screen
 Approximations: TEV is "vertex/material color × texture 0"; no lighting,
 texgen matrices, indirect textures, fog, scissor or render-to-texture yet.
 
+### Input (`boot/input.c`)
+
+Port 1 = keyboard (while the game window has focus) + XInput pad 1;
+ports 2-4 = XInput pads 2-4 (loaded at runtime from `xinput1_4.dll`).
+
+| GameCube | Keyboard | XInput |
+|---|---|---|
+| Control stick | Arrows (Shift = half tilt) | Left stick |
+| C-stick | I / J / K / L | Right stick |
+| A / B / X / Y | X / Z / C / S | A / B / X / Y |
+| Z | D | RB |
+| L / R | Q / W | LT / RT (analog) |
+| START | Enter | Start |
+| D-pad | T / G / F / H | D-pad |
+
+`INPUT_AUTOPRESS="START:22,A:30"` presses buttons at given seconds (testing).
+
 ### REL modules
 
 `ppc2c.py --rel module.rel=symbols.txt` translates a REL linked at runtime:
@@ -111,8 +128,8 @@ texgen matrices, indirect textures, fog, scissor or render-to-texture yet.
   module list (`0x800030C8`), reads the section addresses OSLink assigned and
   registers the module's functions at their real addresses.
 
-Current state: boot logos, the license screen and the title screen (3D scene,
-logo, blinking prompt) render; the game runs stable in its title loop.
+Current state: boot logos, license and title screens render; START on the
+title opens the main menu (`k_main_menu.prd`).
 
 ## Not done yet
 

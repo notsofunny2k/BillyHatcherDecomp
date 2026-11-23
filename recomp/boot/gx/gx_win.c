@@ -66,6 +66,9 @@ void gx_win_pump(void) {
 
 void gx_win_size(int* w, int* h) { *w = win_w; *h = win_h; }
 
+// Keyboard input is only read while the game window is in front.
+int input_window_focused(void) { return hwnd && GetForegroundWindow() == hwnd; }
+
 void gx_win_present(void) {
     SwapBuffers(hdc);
     gx_win_pump();
