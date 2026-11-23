@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Static recompiler: Gekko (PowerPC 750CL) code from a GameCube DOL -> C.
 
 Function boundaries and names come from decomp-toolkit's symbols.txt, jump
@@ -38,6 +38,50 @@ class Dol:
         return None
 
 
+R_PPC_ADDR32, R_PPC_ADDR16_LO, R_PPC_ADDR16_HI, R_PPC_ADDR16_HA, R_PPC_REL24 = 1, 4, 5, 6, 10
+R_DOLPHIN_NOP, R_DOLPHIN_SECTION, R_DOLPHIN_END = 201, 202, 203
+
+
+class RelImage:
+    """A REL module. Guest 'addresses' used by the recompiler are offsets in
+    its code section; real addresses are only known once the game links it."""
+
+    def __init__(self, path):
+        d = Path(path).read_bytes()
+        self.d = d
+        (self.id, _, _, nsec, secoff, _, _, self.version, _, _, impoff, impsz) = struct.unpack(">12I", d[:0x30])
+        self.sections = []
+        for i in range(nsec):
+            o, s = struct.unpack(">II", d[secoff + 8 * i: secoff + 8 * i + 8])
+            self.sections.append((o & ~1, s, o & 1))
+        self.text_sec = next(i for i, (o, s, x) in enumerate(self.sections) if x and s)
+        self.relocs = {}  # (section, offset & ~3) -> (type, module, target section, addend)
+        for i in range(impsz // 8):
+            module, off = struct.unpack(">II", d[impoff + 8 * i: impoff + 8 * i + 8])
+            cur, pos = None, 0
+            while True:
+                delta, typ, sec, add = struct.unpack(">HBBI", d[off: off + 8])
+                off += 8
+                pos += delta
+                if typ == R_DOLPHIN_END:
+                    break
+                if typ == R_DOLPHIN_SECTION:
+                    cur, pos = sec, 0
+                    continue
+                if typ == R_DOLPHIN_NOP:
+                    continue
+                self.relocs[(cur, pos & ~3)] = (typ, module, sec, add)
+
+    def u32(self, a):
+        o, s, _ = self.sections[self.text_sec]
+        if 0 <= a < s:
+            return struct.unpack(">I", self.d[o + a: o + a + 4])[0]
+        return None
+
+    def reloc(self, sec, off):
+        return self.relocs.get((sec, off & ~3))
+
+
 def sext(v, bits):
     m = 1 << (bits - 1)
     return (v & (m - 1)) - (v & m)
@@ -73,40 +117,67 @@ def h(v):
 
 
 class Func:
-    def __init__(self, name, addr, size):
+    prefix = "ppc_"
+
+    def __init__(self, name, addr, size, prefix=None):
         self.name, self.addr, self.size = name, addr, size
+        if prefix:
+            self.prefix = prefix
 
     @property
     def cname(self):
-        return f"ppc_{self.addr:08X}"
+        return f"{self.prefix}{self.addr:08X}"
 
     def contains(self, a):
         return self.addr <= a < self.addr + self.size
 
 
 class Recompiler:
-    def __init__(self, dol, funcs, jumptables):
-        self.dol = dol
+    def __init__(self, dol, funcs, jumptables, rel=None, externs=None):
+        self.dol = dol                          # image providing instruction words
         self.funcs = funcs                      # addr -> Func
         self.sorted_addrs = sorted(funcs)
         self.jumptables = jumptables            # list of (addr, [targets])
         self.referenced = set()                 # function addrs called/branched to
         self.unimpl = defaultdict(int)
+        self.rel = rel                          # RelImage when translating a REL
+        self.externs = externs or {}            # DOL functions callable from a REL
+        self.used_externs = set()
 
     # ---- helpers -------------------------------------------------------
     def func_at(self, a):
         return self.funcs.get(a)
 
-    def call_stmt(self, target, ret_addr):
-        f = self.func_at(target)
+    def rel_reloc(self, a):
+        return self.rel.reloc(self.rel.text_sec, a) if self.rel else None
+
+    def rel_target(self, module, sec, add):
+        """C expression for a relocation target."""
+        if module == 0:
+            return h(add)
+        return f"(ppc_relbase_m{module}[{sec}] + {h(add)})"
+
+    def ext_call(self, target):
+        f = self.externs.get(target)
+        if f:
+            self.used_externs.add(target)
+            return f"{f.cname}(ctx);"
+        return f"ppc_call_indirect(ctx, {h(target)});"
+
+    def call_stmt(self, target, ret_addr, absolute=False):
         s = f"ctx->lr = {h(ret_addr)}; "
+        if absolute:  # REL -> DOL call
+            return s + self.ext_call(target)
+        f = self.func_at(target)
         if f:
             self.referenced.add(target)
             return s + f"{f.cname}(ctx);"
         return s + f"ppc_call_indirect(ctx, {h(target)});"
 
-    def jump_stmt(self, fn, target, ret_addr):
+    def jump_stmt(self, fn, target, ret_addr, absolute=False):
         """Unconditional transfer to target from inside fn."""
+        if absolute:
+            return f"{{ {self.ext_call(target)} return; }}"
         if fn.contains(target) and target != fn.addr:
             return f"goto L_{target:08X};"
         f = self.func_at(target)
@@ -159,6 +230,8 @@ class Recompiler:
 
     def find_switch_table(self, fn, bctr_addr):
         """Recognize `cmplwi rN,K; ... lis rX,T@ha; addi rX,rX,T@l; ... lwzx; mtctr; bctr`."""
+        if self.rel:
+            return self.find_rel_switch_table(fn, bctr_addr)
         hi = {}
         table = None
         count = None
@@ -186,12 +259,43 @@ class Recompiler:
             targets.append(t)
         return targets
 
+    def find_rel_switch_table(self, fn, bctr_addr):
+        """Same pattern in a REL: the table address and its entries are
+        relocations against the module's own sections."""
+        table, count = None, None
+        start = max(fn.addr, bctr_addr - 4 * 24)
+        for a in range(start, bctr_addr, 4):
+            ins = self.dol.u32(a)
+            if ins is None:
+                continue
+            op = ins >> 26
+            r = self.rel_reloc(a)
+            if op == 14 and r and r[0] == R_PPC_ADDR16_LO and r[1] == self.rel.id:
+                table = (r[2], r[3])
+            elif op == 10:
+                count = (ins & 0xFFFF) + 1
+        if table is None or count is None:
+            return []
+        sec, off = table
+        targets = []
+        for i in range(count):
+            r = self.rel.reloc(sec, off + 4 * i)
+            if not r or r[0] != R_PPC_ADDR32 or r[1] != self.rel.id or r[2] != self.rel.text_sec:
+                return []
+            if not fn.contains(r[3]):
+                return []
+            targets.append(r[3])
+        return targets
+
     def recompile(self, fn):
         labels = self.labels_for(fn)
         jt = self.jt_targets(fn)
+        enter = f"0x{fn.addr:08X}u"
+        if self.rel:  # trace real addresses for REL code
+            enter = f"ppc_relbase_m{self.rel.id}[{self.rel.text_sec}] + 0x{fn.addr:X}u"
         lines = [f"// {fn.name} @ {fn.addr:08X} size 0x{fn.size:X}",
                  f"void {fn.cname}(PPCContext* ctx) {{",
-                 f"  PPC_ENTER(0x{fn.addr:08X}u);"]
+                 f"  PPC_ENTER({enter});"]
         last_ends = False
         for a in range(fn.addr, fn.addr + fn.size, 4):
             ins = self.dol.u32(a)
@@ -222,6 +326,26 @@ class Recompiler:
         simm = sext(ins & 0xFFFF, 16)
         uimm = ins & 0xFFFF
         nxt = a + 4
+        # immediate operands as C expressions (relocations replace them)
+        S, S16, U, U16 = h(simm), h(simm << 16), h(uimm), h(uimm << 16)
+        rel = self.rel_reloc(a)
+        if rel:
+            typ, mod, tsec, add = rel
+            if typ == R_PPC_REL24 and op == 18 and mod == 0:  # call/jump into the DOL
+                if ins & 1:
+                    return self.call_stmt(add, nxt, absolute=True), False
+                return self.jump_stmt(fn, add, nxt, absolute=True), True
+            if typ in (R_PPC_ADDR16_LO, R_PPC_ADDR16_HI, R_PPC_ADDR16_HA):
+                T = self.rel_target(mod, tsec, add)
+                if typ == R_PPC_ADDR16_HA:
+                    v = f"((uint32_t)({T} + 0x8000u) >> 16)"
+                elif typ == R_PPC_ADDR16_HI:
+                    v = f"((uint32_t)({T}) >> 16)"
+                else:
+                    v = f"((uint32_t)({T}) & 0xFFFFu)"
+                S = f"(uint32_t)(int32_t)(int16_t){v}"
+                S16 = U16 = f"({v} << 16)"
+                U = v
 
         if op == 18:  # b / bl / ba
             t = (sext(ins & 0x03FFFFFC, 26) + (0 if ins & 2 else a)) & 0xFFFFFFFF
@@ -243,9 +367,9 @@ class Recompiler:
 
         # integer immediates
         if op == 14:
-            return f"{R(rd)} = {ra0(ra)} + {h(simm)};", False
+            return f"{R(rd)} = {ra0(ra)} + {S};", False
         if op == 15:
-            return f"{R(rd)} = {ra0(ra)} + {h(simm << 16)};", False
+            return f"{R(rd)} = {ra0(ra)} + {S16};", False
         if op == 7:
             return f"{R(rd)} = (uint32_t)((int32_t){R(ra)} * {simm});", False
         if op == 8:  # subfic
@@ -262,9 +386,9 @@ class Recompiler:
         if op == 11:
             return f"ppc_cmp_s(ctx, {rd >> 2}, (int32_t){R(ra)}, {simm});", False
         if op == 24:
-            return f"{R(ra)} = {R(rd)} | {h(uimm)};", False
+            return f"{R(ra)} = {R(rd)} | {U};", False
         if op == 25:
-            return f"{R(ra)} = {R(rd)} | {h(uimm << 16)};", False
+            return f"{R(ra)} = {R(rd)} | {U16};", False
         if op == 26:
             return f"{R(ra)} = {R(rd)} ^ {h(uimm)};", False
         if op == 27:
@@ -292,7 +416,7 @@ class Recompiler:
         }
         if op in dform:
             fnc, _, upd = dform[op]
-            ea = f"({R(ra)} + {h(simm)})" if upd or ra else h(simm)
+            ea = f"({R(ra)} + {S})" if upd or ra else S
             load = f"(uint32_t)(int32_t)(int16_t)ld16(ea)" if fnc == "lha" else f"(uint32_t){fnc}(ea)"
             s = f"{{ uint32_t ea = {ea}; {R(rd)} = {load};"
             if upd:
@@ -304,22 +428,22 @@ class Recompiler:
         if op in stores:
             fnc, upd = stores[op]
             cast = {"st32": "", "st16": "(uint16_t)", "st8": "(uint8_t)"}[fnc]
-            ea = f"({R(ra)} + {h(simm)})" if upd or ra else h(simm)
+            ea = f"({R(ra)} + {S})" if upd or ra else S
             s = f"{{ uint32_t ea = {ea}; {fnc}(ea, {cast}{R(rd)});"
             if upd:
                 s += f" {R(ra)} = ea;"
             return s + " }", False
         if op == 46:  # lmw
-            ea = f"({ra0(ra)} + {h(simm)})"
+            ea = f"({ra0(ra)} + {S})"
             return (f"{{ uint32_t ea = {ea}; for (int i = {rd}; i < 32; i++, ea += 4) "
                     f"ctx->r[i] = ld32(ea); }}"), False
         if op == 47:  # stmw
-            ea = f"({ra0(ra)} + {h(simm)})"
+            ea = f"({ra0(ra)} + {S})"
             return (f"{{ uint32_t ea = {ea}; for (int i = {rd}; i < 32; i++, ea += 4) "
                     f"st32(ea, ctx->r[i]); }}"), False
         if 48 <= op <= 55:
             upd = op & 1
-            ea = f"({R(ra)} + {h(simm)})" if upd or ra else h(simm)
+            ea = f"({R(ra)} + {S})" if upd or ra else S
             if op in (48, 49):
                 s = f"{{ uint32_t ea = {ea}; double v = (double)ldf32(ea); {F(rd)} = v; {P1(rd)} = v;"
             elif op in (50, 51):
@@ -375,7 +499,10 @@ class Recompiler:
                 act = f"{{ ctx->lr = {h(nxt)}; ppc_call_indirect(ctx, ctx->ctr); }}"
             elif jt:
                 cases = " ".join(f"case {h(t)}: goto L_{t:08X};" for t in jt)
-                act = (f"{{ switch (ctx->ctr) {{ {cases} default: "
+                sel = "ctx->ctr"
+                if self.rel:  # REL: targets are offsets from the code section base
+                    sel = f"(ctx->ctr - ppc_relbase_m{self.rel.id}[{self.rel.text_sec}])"
+                act = (f"{{ switch ({sel}) {{ {cases} default: "
                        f"ppc_call_indirect(ctx, ctx->ctr); return; }} }}")
             else:
                 act = "{ ppc_call_indirect(ctx, ctx->ctr); return; }"
@@ -665,7 +792,7 @@ def load_symbols(path):
     return funcs, jts, labels
 
 
-def add_mid_function_entries(dol, funcs, labels):
+def add_mid_function_entries(dol, funcs, labels, rel=None):
     """`bl` targets inside another function (e.g. MWCC's _savegpr_27 inside
     __save_gpr) get their own entry: a C function translating from that
     address to the end of the containing function."""
@@ -677,6 +804,8 @@ def add_mid_function_entries(dol, funcs, labels):
             ins = dol.u32(a)
             if ins is None or ins >> 26 != 18 or not ins & 1:
                 continue
+            if rel and rel.reloc(rel.text_sec, a):  # call into another module
+                continue
             t = (sext(ins & 0x03FFFFFC, 26) + (0 if ins & 2 else a)) & 0xFFFFFFFF
             if t in funcs or t in added:
                 continue
@@ -686,9 +815,76 @@ def add_mid_function_entries(dol, funcs, labels):
             parent = funcs[starts[i]]
             if parent.contains(t):
                 name = labels.get(t, f"{parent.name}_{t:08X}")
-                added[t] = Func(name, t, parent.addr + parent.size - t)
+                added[t] = Func(name, t, parent.addr + parent.size - t, prefix=parent.prefix)
     funcs.update(added)
     return len(added)
+
+
+def add_entries_for_targets(funcs, labels, targets):
+    """Give DOL addresses that other modules branch to (mid-function labels
+    such as _savefpr_N) their own entry points."""
+    import bisect
+    starts = sorted(funcs)
+    n = 0
+    for t in sorted(targets):
+        if t in funcs:
+            continue
+        i = bisect.bisect_right(starts, t) - 1
+        if i < 0:
+            continue
+        parent = funcs[starts[i]]
+        if parent.contains(t):
+            funcs[t] = Func(labels.get(t, f"{parent.name}_{t:08X}"), t, parent.addr + parent.size - t)
+            n += 1
+    return n
+
+
+def rel_dol_targets(rel_path):
+    rel = RelImage(rel_path)
+    return {add for (typ, mod, sec, add) in rel.relocs.values() if typ == R_PPC_REL24 and mod == 0}
+
+
+def generate_rel(rel_path, rel_symbols, out, dol_funcs, hle_names):
+    """Translate a REL module. Its functions are registered at runtime, once
+    the game has linked the module and its section addresses are known."""
+    rel = RelImage(rel_path)
+    funcs, _, labels = load_symbols(rel_symbols)
+    prefix = f"ppc_m{rel.id}_"
+    for f in funcs.values():
+        f.prefix = prefix
+    add_mid_function_entries(rel, funcs, labels, rel=rel)
+    rc = Recompiler(rel, funcs, [], rel=rel, externs=dol_funcs)
+    sel = sorted(funcs.values(), key=lambda f: f.addr)
+    bodies = []
+    for f in sel:
+        if f.name in hle_names:
+            bodies.append(f"void hle_{f.name}(PPCContext* ctx);\n"
+                          f"void {f.cname}(PPCContext* ctx) {{ hle_{f.name}(ctx); }}")
+        else:
+            bodies.append(rc.recompile(f))
+    m = rel.id
+    lines = ["// Generated by ppc2c.py from the game's REL module. Do not commit or distribute.",
+             '#include "ppc_context.h"', '#include "ppc_runtime.h"', "",
+             f"uint32_t ppc_relbase_m{m}[32];  // section addresses, set when the game links the module", ""]
+    for a in sorted(rc.used_externs):
+        lines.append(f"void {dol_funcs[a].cname}(PPCContext* ctx); // {dol_funcs[a].name}")
+    for f in sel:
+        lines.append(f"void {f.cname}(PPCContext* ctx);")
+    lines.append("")
+    lines += bodies
+    lines.append("")
+    lines.append(f"static const PPCRelFunc funcs_m{m}[] = {{")
+    for f in sel:
+        nm = f.name.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'  {{ 0x{f.addr:X}u, {f.cname}, "{nm}" }},')
+    lines.append("};")
+    lines.append(f"const PPCRelModule ppc_rel_m{m} = {{ {m}u, {rel.text_sec}u, ppc_relbase_m{m}, "
+                 f"funcs_m{m}, {len(sel)} }};")
+    (out / f"ppc_rel_m{m}.c").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    unimpl = sum(rc.unimpl.values())
+    print(f"REL module {m}: {len(sel)} functions, {len(rc.used_externs)} calls into the DOL, "
+          f"{unimpl} unimplemented instructions")
+    return m
 
 
 def main():
@@ -703,6 +899,8 @@ def main():
     ap.add_argument("--hle", type=Path,
                     help="file with function names implemented natively by the runtime "
                          "(one per line); they become calls to hle_<name>(ctx)")
+    ap.add_argument("--rel", action="append", default=[], metavar="MODULE.rel=SYMBOLS.txt",
+                    help="also translate a REL module (dtk symbols for it after '=')")
     args = ap.parse_args()
     hle_names = set()
     if args.hle:
@@ -714,6 +912,8 @@ def main():
     dol = Dol(args.dol)
     funcs, jt_syms, labels = load_symbols(args.symbols)
     n_mid = add_mid_function_entries(dol, funcs, labels)
+    for spec in args.rel:  # entry points that REL modules call into
+        n_mid += add_entries_for_targets(funcs, labels, rel_dol_targets(spec.partition("=")[0]))
     if n_mid:
         print(f"added {n_mid} mid-function entry points")
     jumptables = []
@@ -788,6 +988,19 @@ def main():
     tbl.append("};")
     tbl.append(f"const size_t ppc_func_table_size = {len(generated | set(stubs))};")
     (args.out / "ppc_table.c").write_text("\n".join(tbl) + "\n", encoding="utf-8")
+
+    # REL modules + the list the runtime uses to register them once linked
+    rel_ids = []
+    for spec in args.rel:
+        rel_path, _, rel_syms = spec.partition("=")
+        rel_ids.append(generate_rel(rel_path, rel_syms, args.out, funcs, hle_names))
+    lst = ['// Generated by ppc2c.py. Do not commit or distribute.', '#include "ppc_runtime.h"', ""]
+    for m in rel_ids:
+        lst.append(f"extern const PPCRelModule ppc_rel_m{m};")
+    entries = ", ".join(f"&ppc_rel_m{m}" for m in rel_ids) or "0"
+    lst.append(f"const PPCRelModule* const ppc_rel_modules[] = {{ {entries} }};")
+    lst.append(f"const size_t ppc_rel_module_count = {len(rel_ids)};")
+    (args.out / "ppc_rel_list.c").write_text("\n".join(lst) + "\n", encoding="utf-8")
 
     total_unimpl = sum(rc.unimpl.values())
     print(f"recompiled {len(selected)} functions, {len(stubs)} stubs, "

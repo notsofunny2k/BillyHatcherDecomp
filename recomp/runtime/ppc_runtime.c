@@ -51,7 +51,11 @@ volatile uint32_t ppc_trace_ring[1024];
 volatile uint32_t ppc_trace_lr[1024];
 volatile uint32_t ppc_trace_pos;
 
+static int dyn_get(uint32_t addr, PPCFunc* fn, const char** name);
+
 const char* ppc_func_name(uint32_t addr) {
+    const char* rel_name;
+    if ((addr < 0x80003000u || addr >= 0x80400000u) && dyn_get(addr, NULL, &rel_name)) return rel_name;
     size_t lo = 0, hi = ppc_func_table_size;
     while (lo < hi) {  // last entry with entry.addr <= addr
         size_t mid = (lo + hi) / 2;
@@ -93,7 +97,52 @@ void ppc_fatal(const char* fmt, ...) {
     exit(3);
 }
 
+// ---- REL modules linked at runtime --------------------------------------
+#define OS_MODULE_LIST_HEAD 0x800030C8u
+#define DYN_SIZE 16384u
+static struct { uint32_t addr; PPCFunc fn; const char* name; } dyn[DYN_SIZE];
+
+static void dyn_put(uint32_t addr, PPCFunc fn, const char* name) {
+    uint32_t i = (addr >> 2) * 2654435761u % DYN_SIZE;
+    while (dyn[i].addr && dyn[i].addr != addr) i = (i + 1) % DYN_SIZE;
+    dyn[i].addr = addr; dyn[i].fn = fn; dyn[i].name = name;
+}
+
+static int dyn_get(uint32_t addr, PPCFunc* fn, const char** name) {
+    uint32_t i = (addr >> 2) * 2654435761u % DYN_SIZE;
+    for (uint32_t n = 0; n < DYN_SIZE && dyn[i].addr; n++, i = (i + 1) % DYN_SIZE)
+        if (dyn[i].addr == addr) { if (fn) *fn = dyn[i].fn; if (name) *name = dyn[i].name; return 1; }
+    return 0;
+}
+
+// Walks the OS list of linked modules and (re)registers translated ones.
+static int ppc_rel_resolve(void) {
+    int changed = 0;
+    for (uint32_t m = ld32(OS_MODULE_LIST_HEAD); m; m = ld32(m + 4)) {
+        uint32_t id = ld32(m), nsec = ld32(m + 0xC), info = ld32(m + 0x10);
+        for (size_t k = 0; k < ppc_rel_module_count; k++) {
+            const PPCRelModule* mod = ppc_rel_modules[k];
+            if (!mod || mod->id != id) continue;
+            uint32_t text = ld32(info + 8 * mod->text_sec) & ~1u;
+            if (mod->base[mod->text_sec] == text) continue;  // already registered here
+            for (uint32_t s = 0; s < nsec && s < 32; s++) mod->base[s] = ld32(info + 8 * s) & ~1u;
+            for (size_t i = 0; i < mod->count; i++)
+                dyn_put(text + mod->funcs[i].offset, mod->funcs[i].fn, mod->funcs[i].name);
+            fprintf(stderr, "ppc: REL module %u linked, code at %08X, %u functions registered\n", id, text,
+                    (unsigned)mod->count);
+            changed = 1;
+        }
+    }
+    return changed;
+}
+
 PPCFunc ppc_lookup(uint32_t addr) {
+    PPCFunc fn;
+    if (addr < 0x80003000u || addr >= 0x80400000u) {  // outside the DOL: maybe a REL
+        if (dyn_get(addr, &fn, NULL)) return fn;
+        if (ppc_rel_resolve() && dyn_get(addr, &fn, NULL)) return fn;
+        return NULL;
+    }
     size_t lo = 0, hi = ppc_func_table_size;
     while (lo < hi) {
         size_t mid = (lo + hi) / 2;

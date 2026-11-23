@@ -18,6 +18,22 @@ typedef struct PPCFuncEntry {
 extern const PPCFuncEntry ppc_func_table[];
 extern const size_t ppc_func_table_size;
 
+// REL modules translated ahead of time. Their functions get real addresses
+// once the game links the module (OSLink); see ppc_rel_resolve().
+typedef struct PPCRelFunc {
+    uint32_t offset;  // offset in the module's code section
+    PPCFunc fn;
+    const char* name;
+} PPCRelFunc;
+typedef struct PPCRelModule {
+    uint32_t id, text_sec;
+    uint32_t* base;  // section addresses, filled in at registration
+    const PPCRelFunc* funcs;
+    size_t count;
+} PPCRelModule;
+extern const PPCRelModule* const ppc_rel_modules[];
+extern const size_t ppc_rel_module_count;
+
 int ppc_mem_init(void);
 int ppc_load_dol(const char* path, uint32_t* entry);
 PPCFunc ppc_lookup(uint32_t addr);

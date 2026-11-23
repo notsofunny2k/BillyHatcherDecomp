@@ -98,13 +98,24 @@ reads its files from the disc and reaches the license screen
 Approximations: TEV is "vertex/material color × texture 0"; no lighting,
 texgen matrices, indirect textures, fog, scissor or render-to-texture yet.
 
-Current state: boot logos render correctly; the game reaches the title,
-where it links a REL module at runtime (not translated yet).
+### REL modules
+
+`ppc2c.py --rel module.rel=symbols.txt` translates a REL linked at runtime:
+
+- relocations against the DOL are resolved at translation time (absolute
+  addresses, direct calls into the DOL; mid-function targets such as
+  `_savefpr_N` get DOL entry points);
+- relocations against the module itself become `ppc_relbase_mN[section] + off`;
+- switch tables are found through the module's own relocations;
+- on the first indirect call into unknown memory, the runtime walks the OS
+  module list (`0x800030C8`), reads the section addresses OSLink assigned and
+  registers the module's functions at their real addresses.
+
+Current state: boot logos, the license screen and the title screen (3D scene,
+logo, blinking prompt) render; the game runs stable in its title loop.
 
 ## Not done yet
 
-- RELs loaded at runtime (`OSLink`): `movie_module.rel` must be translated
-  with its relocations resolved against the load address.
 - Full TEV / lighting / render-to-texture.
 - Audio: AX runs without a DSP (silent); AI/ADX output not mixed.
 - Input: the pad is always neutral (SDL planned).

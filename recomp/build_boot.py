@@ -34,7 +34,8 @@ def main():
     obj.mkdir(parents=True, exist_ok=True)
     subprocess.run([sys.executable, str(ROOT / "recomp/ppc2c.py"), args.dol,
                     str(ROOT / "config/GEZE8P/symbols.txt"), str(gen),
-                    "--hle", str(ROOT / "recomp/boot/hle.txt")], check=True)
+                    "--hle", str(ROOT / "recomp/boot/hle.txt"),
+                    "--rel", f"{ROOT / 'orig/GEZE8P/files/movie_module.rel'}={ROOT / 'config/GEZE8P/movie_module/symbols.txt'}"], check=True)
 
     runtime = ROOT / "recomp/runtime"
     boot = ROOT / "recomp/boot"
