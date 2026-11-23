@@ -115,6 +115,25 @@ ports 2-4 = XInput pads 2-4 (loaded at runtime from `xinput1_4.dll`).
 
 `INPUT_AUTOPRESS="START:22,A:30"` presses buttons at given seconds (testing).
 
+### Audio (`boot/audio/`)
+
+The AX library runs translated; the DSP running the AX microcode is replaced:
+
+- a 5 ms real-time tick raises the AI DMA interrupt; `__AXOutAiCallback` is
+  native: it runs the translated `__AXOutNewFrame` (voice sync, CRI/ADX
+  callbacks, next command list) and then mixes one frame;
+- `ax_mix.c` mixes the 64 DSP-side parameter blocks (`0x8028FB00`, 0xF4 bytes
+  each): ADPCM / PCM16 / PCM8 from ARAM, loops (incl. ADPCM loop context),
+  sample-rate conversion (linear), envelope and L/R volume ramps; it writes
+  state, current address, ADPCM history and volumes back like the DSP;
+- `audio_out.c` plays 32 kHz stereo through waveOut (20 ms blocks, latency
+  capped).
+
+Not yet: aux buses (reverb/chorus), surround, ITD, low-pass filter,
+4-tap polyphase SRC, per-ms parameter updates.
+
+`GX_WINDOW=background` opens the window minimized without taking focus.
+
 ### REL modules
 
 `ppc2c.py --rel module.rel=symbols.txt` translates a REL linked at runtime:

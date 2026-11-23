@@ -8,6 +8,7 @@
 
 #include <windows.h>
 
+#include "audio/audio.h"
 #include "gx/gx_internal.h"
 #include "hle_dvd.h"
 #include "hle_irq.h"
@@ -70,6 +71,14 @@ static int setup_low_memory(const char* sysdir) {
     return 1;
 }
 
+void boot_print_stats(void) {
+    hle_dvd_stats();
+    gx_stats();
+    ax_mix_stats();
+    hle_thread_dump();
+    fflush(stderr);
+}
+
 static volatile int g_timeout = 20;
 
 static DWORD WINAPI watchdog(LPVOID arg) {
@@ -85,14 +94,14 @@ static DWORD WINAPI watchdog(LPVOID arg) {
         if (still >= 3) {
             fprintf(stderr, "boot: no new guest calls for 3 s (stuck in a loop?)\n");
             ppc_dump_trace(32);
-            hle_dvd_stats(); gx_stats(); hle_thread_dump();
+            boot_print_stats();
             fflush(stderr);
             ExitProcess(4);
         }
         if (elapsed >= g_timeout) {
             fprintf(stderr, "boot: timeout after %d s (guest still running)\n", elapsed);
             ppc_dump_trace(32);
-            hle_dvd_stats(); gx_stats(); hle_thread_dump();
+            boot_print_stats();
             fflush(stderr);
             ExitProcess(5);
         }

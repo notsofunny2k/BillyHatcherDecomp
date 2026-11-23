@@ -76,7 +76,7 @@ static void aram_dma(void) {
     // DMA finished: clear "ARAM DMA busy" (0x200), raise ARINT (0x20)
     uint16_t csr = (uint16_t)((reg16(0x500A) & ~0x200u) | 0x20u);
     set16(0x500A, csr);
-    if (csr & 0x10) ppc_raise_irq(6);  // ARINTMSK set: __OS_INTERRUPT_DSP_ARAM
+    if (csr & 0x40) ppc_raise_irq(6);  // ARINTMSK set: __OS_INTERRUPT_DSP_ARAM
 }
 
 // DSP control/status: interrupt bits are write-one-to-clear.
@@ -105,6 +105,10 @@ void ppc_mmio_write(uint32_t a, uint32_t v, int size) {
     note(a, size, 1, v);
     if (size == 4) v = complete_transfers(off, v);
     if (off == 0x500A && size == 2) { write_dsp_csr((uint16_t)v); return; }
+    // CPU->DSP mailbox: there is no DSP, so mail is "read" immediately
+    // (clears the pending bit that DSPCheckMailToDSP polls).
+    if (off == 0x5000 && size == 4) { set16(0x5000, (uint16_t)((v >> 16) & 0x7FFF)); set16(0x5002, (uint16_t)v); return; }
+    if (off == 0x5000 && size == 2) { set16(0x5000, (uint16_t)(v & 0x7FFF)); return; }
     if (off == 0x5008 && size == 4) {  // 32-bit write covering the CSR's low half
         set16(0x5008, (uint16_t)(v >> 16));
         write_dsp_csr((uint16_t)v);

@@ -39,8 +39,8 @@ def main():
 
     runtime = ROOT / "recomp/runtime"
     boot = ROOT / "recomp/boot"
-    sources = sorted(gen.glob("*.c")) + sorted(runtime.glob("*.c")) + sorted(boot.glob("*.c")) + sorted((boot / "gx").glob("*.c"))
-    headers = b"".join(p.read_bytes() for p in sorted(list(runtime.glob("*.h")) + list(boot.glob("*.h")) + list((boot / "gx").glob("*.h")) + [gen / "ppc_funcs.h"]))
+    sources = sorted(gen.glob("*.c")) + sorted(runtime.glob("*.c")) + sorted(boot.glob("*.c")) + sorted((boot / "gx").glob("*.c")) + sorted((boot / "audio").glob("*.c"))
+    headers = b"".join(p.read_bytes() for p in sorted(list(runtime.glob("*.h")) + list(boot.glob("*.h")) + list((boot / "gx").glob("*.h")) + list((boot / "audio").glob("*.h")) + [gen / "ppc_funcs.h"]))
 
     def compile_one(src):
         key = hashlib.sha1(src.read_bytes() + headers + " ".join(CFLAGS).encode()).hexdigest()[:16]
@@ -60,7 +60,7 @@ def main():
         print("\n".join(errors)[:8000])
         sys.exit(1)
     exe = gen / "boot.exe"
-    subprocess.run([args.cc, *[str(o) for o, _ in results], "-o", str(exe), "-lm", "-lopengl32", "-lgdi32"], check=True)
+    subprocess.run([args.cc, *[str(o) for o, _ in results], "-o", str(exe), "-lm", "-lopengl32", "-lgdi32", "-lwinmm"], check=True)
     print(f"built {exe}")
     if args.run:
         r = subprocess.run([str(exe), args.dol, args.sys, args.iso, args.timeout])

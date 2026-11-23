@@ -1,6 +1,7 @@
 // Win32 window + legacy OpenGL context for the GX backend.
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <windows.h>
 #include <GL/gl.h>
@@ -32,10 +33,13 @@ int gx_win_open(void) {
     RegisterClassA(&wc);
     RECT r = {0, 0, win_w, win_h};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    hwnd = CreateWindowA(wc.lpszClassName, "Billy Hatcher (recomp)", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+    hwnd = CreateWindowA(wc.lpszClassName, "Billy Hatcher (recomp)", WS_OVERLAPPEDWINDOW,
                          CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL,
                          wc.hInstance, NULL);
     if (!hwnd) return 0;
+    // GX_WINDOW=background: start minimized without stealing focus (automated runs)
+    const char* mode = getenv("GX_WINDOW");
+    ShowWindow(hwnd, (mode && !strcmp(mode, "background")) ? SW_SHOWMINNOACTIVE : SW_SHOW);
     hdc = GetDC(hwnd);
     PIXELFORMATDESCRIPTOR pfd = {sizeof(pfd), 1, PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
                                  PFD_TYPE_RGBA, 32, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 24, 8, 0,
@@ -59,7 +63,8 @@ void gx_win_pump(void) {
         DispatchMessageA(&m);
     }
     if (quit_requested) {
-        gx_stats();
+        fprintf(stderr, "boot: window closed\n");
+        boot_print_stats();
         ExitProcess(0);
     }
 }

@@ -15,6 +15,9 @@ unsigned gx_tex_get(uint32_t addr, int w, int h, int fmt, uint32_t tlut_tmem, in
                     const uint8_t* tmem);
 void gx_tex_invalidate(void);
 
+// boot_main.c: prints DVD/GX/audio/thread statistics
+void boot_print_stats(void);
+
 // public (gx.c)
 void gx_install(void);
 void gx_stats(void);

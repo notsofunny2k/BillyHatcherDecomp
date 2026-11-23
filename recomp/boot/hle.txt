@@ -8,6 +8,8 @@ __OSStopAudioSystem
 __AI_SRC_INIT
 __DSP_boot_task
 __AXOutInitDSP
+# AX audio frames: native DSP replacement (audio/ax_mix.c)
+__AXOutAiCallback
 RealMode
 # Interrupts (hle_irq.c)
 OSDisableInterrupts
