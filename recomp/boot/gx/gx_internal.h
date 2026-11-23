@@ -15,6 +15,14 @@ unsigned gx_tex_get(uint32_t addr, int w, int h, int fmt, uint32_t tlut_tmem, in
                     const uint8_t* tmem);
 void gx_tex_invalidate(void);
 
+// shaders / modern GL entry points (gx_shader.c)
+int gx_gl_load(void);
+void gx_gl_active_texture(int unit);
+void gx_gl_blend_equation(unsigned e);
+void gx_gl_attrib(int idx, int size, const float* data);
+int gx_shader_bind(const uint32_t* bp, const float k[16], const float reg[16], float aref0, float aref1);
+int gx_shader_count(void);
+
 // boot_main.c: prints DVD/GX/audio/thread statistics
 void boot_print_stats(void);
 

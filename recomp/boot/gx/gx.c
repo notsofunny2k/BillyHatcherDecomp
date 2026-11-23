@@ -1,7 +1,7 @@
 // GX command processor: consumes the write-gather pipe stream (0xCC008000),
 // tracks CP / XF / BP register state and draws primitives with OpenGL.
-// First version: fixed-function approximation (vertex color x texture 0),
-// no lighting, no full TEV, no render-to-texture.
+// Vertices are transformed, lit and texgen'd on the CPU; TEV runs as
+// generated GLSL (gx_shader.c). No fog, indirect textures or render-to-texture yet.
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,10 +24,13 @@ static uint8_t fifo[1 << 20];
 static size_t fifo_len;
 
 static struct {
-    unsigned long long cmds, draws, verts, frames, unknown;
+    unsigned long long cmds, draws, verts, frames, unknown, t_first, t_last;
 } st;
 
 static int gx_ready;
+static LARGE_INTEGER qpf;
+static long long t_draw, t_decode, t_state;
+static long long qpc(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 
 static float xf_f(uint32_t a) { float f; uint32_t v = xf_mem[a & 0x10FF]; memcpy(&f, &v, 4); return f; }
 
@@ -117,7 +120,10 @@ static const uint8_t* array_ptr(int arr, uint32_t idx) {
     return ppc_ptr(0x80000000u | ((cp[0xA0 + arr] + idx * (cp[0xB0 + arr] & 0xFF)) & 0x01FFFFFFu));
 }
 
-typedef struct { float pos[3], col[4], tex[2]; int pm; int has_col, has_tex; } Vtx;
+typedef struct {
+    float pos[3], nrm[3], col[2][4], tex[8][2];
+    int pm, tm[8], has_nrm, has_col[2], has_tex[8];
+} Vtx;
 
 static const uint8_t* attr(const uint8_t** pp, int mode, int arr) {
     const uint8_t* p = *pp;
@@ -127,10 +133,17 @@ static const uint8_t* attr(const uint8_t** pp, int mode, int arr) {
     return array_ptr(arr, idx);
 }
 
+static float nrm_scale(int fmt) { return fmt == 1 ? 1.0f / 64.0f : fmt == 3 ? 1.0f / 16384.0f : 1.0f; }
+
 static const uint8_t* decode_vertex(const uint8_t* p, const VtxFmt* f, Vtx* v) {
-    v->pm = (int)(cp[0x30] & 63);
+    uint32_t ma = cp[0x30], mb = cp[0x40];
+    v->pm = (int)(ma & 63);
+    v->tm[0] = (int)((ma >> 6) & 63); v->tm[1] = (int)((ma >> 12) & 63);
+    v->tm[2] = (int)((ma >> 18) & 63); v->tm[3] = (int)((ma >> 24) & 63);
+    v->tm[4] = (int)(mb & 63); v->tm[5] = (int)((mb >> 6) & 63);
+    v->tm[6] = (int)((mb >> 12) & 63); v->tm[7] = (int)((mb >> 18) & 63);
     if (f->pmidx) v->pm = (int)rd8(p++);
-    for (int i = 0; i < 8; i++) if (f->tmidx[i]) p++;
+    for (int i = 0; i < 8; i++) if (f->tmidx[i]) v->tm[i] = (int)rd8(p++);
     // position
     {
         int n = f->pos_cnt ? 3 : 2, cs = comp_size(f->pos_fmt);
@@ -138,45 +151,47 @@ static const uint8_t* decode_vertex(const uint8_t* p, const VtxFmt* f, Vtx* v) {
         for (int i = 0; i < 3; i++) v->pos[i] = i < n ? read_comp(q + i * cs, f->pos_fmt, f->pos_shift) : 0.f;
         if (f->pos == 1) p += n * cs;
     }
-    // normal (skipped for now)
+    // normal (first of N/B/T)
+    v->has_nrm = 0;
     if (f->nrm) {
         int cs = comp_size(f->nrm_fmt);
+        const uint8_t* q = attr(&p, f->nrm, 1);
+        float s = nrm_scale(f->nrm_fmt);
+        for (int i = 0; i < 3; i++) v->nrm[i] = read_comp(q + i * cs, f->nrm_fmt, 0) * s;
+        v->has_nrm = 1;
         if (f->nrm == 1) p += cs * 3 * (f->nrm_cnt ? 3 : 1);
-        else p += idx_size(f->nrm) * ((f->nrm_cnt && (cp[0x70] >> 31)) ? 3 : 1);
+        else if (f->nrm_cnt && (cp[0x70] >> 31)) p += idx_size(f->nrm) * 2;  // NBT with 3 indices
     }
     // colors
-    v->has_col = 0;
     for (int c = 0; c < 2; c++) {
+        v->has_col[c] = 0;
         if (!f->col[c]) continue;
         const uint8_t* q = attr(&p, f->col[c], 2 + c);
-        float col[4];
-        read_color(q, f->col_fmt[c], col);
+        read_color(q, f->col_fmt[c], v->col[c]);
         if (f->col[c] == 1) p += col_size(f->col_fmt[c]);
-        if (c == 0) { memcpy(v->col, col, sizeof(col)); v->has_col = 1; }
+        v->has_col[c] = 1;
     }
     // texture coordinates
-    v->has_tex = 0;
     for (int t = 0; t < 8; t++) {
+        v->has_tex[t] = 0;
         if (!f->tex[t]) continue;
         int n = f->tex_cnt[t] ? 2 : 1, cs = comp_size(f->tex_fmt[t]);
         const uint8_t* q = attr(&p, f->tex[t], 4 + t);
-        if (t == 0) {
-            v->tex[0] = read_comp(q, f->tex_fmt[t], f->tex_shift[t]);
-            v->tex[1] = n > 1 ? read_comp(q + cs, f->tex_fmt[t], f->tex_shift[t]) : 0.f;
-            v->has_tex = 1;
-        }
+        v->tex[t][0] = read_comp(q, f->tex_fmt[t], f->tex_shift[t]);
+        v->tex[t][1] = n > 1 ? read_comp(q + cs, f->tex_fmt[t], f->tex_shift[t]) : 0.f;
+        v->has_tex[t] = 1;
         if (f->tex[t] == 1) p += n * cs;
     }
     return p;
 }
 
 // --------------------------------------------------------- transforms
-static void transform(const Vtx* v, float out[4]) {
-    uint32_t m = (uint32_t)v->pm * 4u;
-    float e[3];
-    for (int r = 0; r < 3; r++)
-        e[r] = xf_f(m + r * 4) * v->pos[0] + xf_f(m + r * 4 + 1) * v->pos[1] + xf_f(m + r * 4 + 2) * v->pos[2] +
-               xf_f(m + r * 4 + 3);
+static void mtx_row(uint32_t base, int r, const float* in4, float* out) {
+    *out = xf_f(base + r * 4) * in4[0] + xf_f(base + r * 4 + 1) * in4[1] + xf_f(base + r * 4 + 2) * in4[2] +
+           xf_f(base + r * 4 + 3) * in4[3];
+}
+
+static void project(const float e[3], float out[4]) {
     float p0 = xf_f(0x1020), p1 = xf_f(0x1021), p2 = xf_f(0x1022), p3 = xf_f(0x1023), p4 = xf_f(0x1024),
           p5 = xf_f(0x1025);
     if (xf_mem[0x1026] == 0) {  // perspective
@@ -191,6 +206,116 @@ static void transform(const Vtx* v, float out[4]) {
         out[3] = 1.0f;
     }
     out[2] = 2.0f * out[2] + out[3];  // GX clip z in [-w, 0] -> GL [-w, w]
+}
+
+static void unpack_rgba(uint32_t c, float* o) {
+    o[0] = (c >> 24) / 255.f; o[1] = ((c >> 16) & 255) / 255.f; o[2] = ((c >> 8) & 255) / 255.f; o[3] = (c & 255) / 255.f;
+}
+
+static float clamp01(float x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
+
+// One lighting channel component (color rgb or alpha) per GX channel control.
+static void light_channel(uint32_t ctrl, const float* vtx_col, int has_col, uint32_t mat_reg, uint32_t amb_reg,
+                          const float eye[3], const float n[3], int has_n, float out[4]) {
+    float mat[4], amb[4];
+    unpack_rgba(mat_reg, mat);
+    unpack_rgba(amb_reg, amb);
+    if (ctrl & 1) { if (has_col) memcpy(mat, vtx_col, sizeof(mat)); else mat[0] = mat[1] = mat[2] = mat[3] = 1.f; }
+    if (!(ctrl & 2)) { memcpy(out, mat, sizeof(mat)); return; }
+    if (ctrl & 0x40) { if (has_col) memcpy(amb, vtx_col, sizeof(amb)); else amb[0] = amb[1] = amb[2] = amb[3] = 1.f; }
+    float lit[4] = {amb[0], amb[1], amb[2], amb[3]};
+    uint32_t mask = ((ctrl >> 2) & 15) | (((ctrl >> 11) & 15) << 4);
+    int diff_fn = (int)((ctrl >> 7) & 3), attn_en = (ctrl >> 9) & 1, spot = (ctrl >> 10) & 1;
+    for (int i = 0; i < 8; i++) {
+        if (!(mask & (1u << i))) continue;
+        uint32_t L = 0x600u + 16u * (uint32_t)i;
+        float lc[4];
+        unpack_rgba(xf_mem[L + 3], lc);
+        float lp[3] = {xf_f(L + 10), xf_f(L + 11), xf_f(L + 12)};
+        float ld[3] = {xf_f(L + 13), xf_f(L + 14), xf_f(L + 15)};
+        float dv[3] = {lp[0] - eye[0], lp[1] - eye[1], lp[2] - eye[2]};
+        float dist2 = dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2];
+        float dist = sqrtf(dist2);
+        float ldir[3] = {0, 0, 0};
+        if (dist > 0) { ldir[0] = dv[0] / dist; ldir[1] = dv[1] / dist; ldir[2] = dv[2] / dist; }
+        float atten = 1.f;
+        if (attn_en) {
+            if (spot) {
+                float cosa = -(ldir[0] * ld[0] + ldir[1] * ld[1] + ldir[2] * ld[2]);
+                if (cosa < 0) cosa = 0;
+                float aa = xf_f(L + 4) + xf_f(L + 5) * cosa + xf_f(L + 6) * cosa * cosa;
+                float da = xf_f(L + 7) + xf_f(L + 8) * dist + xf_f(L + 9) * dist2;
+                atten = (aa > 0 ? aa : 0) / (da > 1e-6f ? da : 1e-6f);
+            } else {  // specular: direction-based; approximate with diffuse only
+                atten = 1.f;
+            }
+        }
+        float d = 1.f;
+        if (diff_fn && has_n) {
+            d = n[0] * ldir[0] + n[1] * ldir[1] + n[2] * ldir[2];
+            if (diff_fn == 2 && d < 0) d = 0;
+        }
+        for (int k = 0; k < 4; k++) lit[k] += lc[k] * d * atten;
+    }
+    for (int k = 0; k < 4; k++) out[k] = mat[k] * clamp01(lit[k]);
+}
+
+typedef struct {
+    float pos[4], col[2][4], tex[8][3];
+} OutVtx;
+
+static void process_vertex(const Vtx* v, OutVtx* o) {
+    // position -> eye space
+    uint32_t m = (uint32_t)v->pm * 4u;
+    float in4[4] = {v->pos[0], v->pos[1], v->pos[2], 1.f};
+    float eye[3];
+    for (int r = 0; r < 3; r++) mtx_row(m, r, in4, &eye[r]);
+    project(eye, o->pos);
+    // normal -> eye space (normal matrix: 3 words per row)
+    float n[3] = {0, 0, 1};
+    if (v->has_nrm) {
+        uint32_t nb = 0x400u + 3u * ((uint32_t)v->pm & 31u);
+        for (int r = 0; r < 3; r++)
+            n[r] = xf_f(nb + r * 3) * v->nrm[0] + xf_f(nb + r * 3 + 1) * v->nrm[1] + xf_f(nb + r * 3 + 2) * v->nrm[2];
+        float l = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (l > 0) { n[0] /= l; n[1] /= l; n[2] /= l; }
+    }
+    // lighting channels: color ctrl 0x100E/0x100F, alpha ctrl 0x1010/0x1011
+    int nchan = (int)(xf_mem[0x1009] & 3);
+    for (int c = 0; c < 2; c++) {
+        float rgb[4], al[4];
+        if (c >= nchan && nchan) { o->col[c][0] = o->col[c][1] = o->col[c][2] = o->col[c][3] = 0; continue; }
+        light_channel(xf_mem[0x100E + c], v->col[c], v->has_col[c], xf_mem[0x100C + c], xf_mem[0x100A + c], eye, n,
+                      v->has_nrm, rgb);
+        light_channel(xf_mem[0x1010 + c], v->col[c], v->has_col[c], xf_mem[0x100C + c], xf_mem[0x100A + c], eye, n,
+                      v->has_nrm, al);
+        o->col[c][0] = rgb[0]; o->col[c][1] = rgb[1]; o->col[c][2] = rgb[2]; o->col[c][3] = al[3];
+    }
+    // texgen (XF 0x1040+i)
+    int ngen = (int)(xf_mem[0x103F] & 15);
+    for (int i = 0; i < 8; i++) {
+        o->tex[i][0] = o->tex[i][1] = 0; o->tex[i][2] = 1;
+        if (i >= ngen) continue;
+        uint32_t g = xf_mem[0x1040 + i];
+        int stq = (g >> 1) & 1, type = (g >> 4) & 7, row = (int)((g >> 7) & 31);
+        float src[4] = {0, 0, 1, 1};
+        if (row == 0) { src[0] = v->pos[0]; src[1] = v->pos[1]; src[2] = v->pos[2]; }
+        else if (row == 1) { src[0] = v->nrm[0]; src[1] = v->nrm[1]; src[2] = v->nrm[2]; }
+        else if (row >= 5 && row <= 12) { src[0] = v->tex[row - 5][0]; src[1] = v->tex[row - 5][1]; }
+        if (type == 2 || type == 3) {  // color as texcoord
+            o->tex[i][0] = o->col[type - 2][0]; o->tex[i][1] = o->col[type - 2][1];
+            continue;
+        }
+        if (type == 1) {  // emboss: pass the source coordinate through
+            o->tex[i][0] = src[0]; o->tex[i][1] = src[1];
+            continue;
+        }
+        if (!((g >> 2) & 1)) src[2] = 1.f;  // AB11 input form
+        uint32_t tm = (uint32_t)v->tm[i] * 4u;
+        mtx_row(tm, 0, src, &o->tex[i][0]);
+        mtx_row(tm, 1, src, &o->tex[i][1]);
+        if (stq) mtx_row(tm, 2, src, &o->tex[i][2]);
+    }
 }
 
 // ------------------------------------------------------------- render
@@ -213,7 +338,13 @@ static void apply_blend_depth(void) {
         static const GLenum dfac[8] = {GL_ZERO, GL_ONE, GL_SRC_COLOR, GL_ONE_MINUS_SRC_COLOR,
                                        GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_DST_ALPHA, GL_ONE_MINUS_DST_ALPHA};
         glEnable(GL_BLEND);
-        glBlendFunc(fac[(cm >> 8) & 7], dfac[(cm >> 5) & 7]);
+        if (cm & (1u << 11)) {  // subtract mode
+            gx_gl_blend_equation(0x800B /* GL_FUNC_REVERSE_SUBTRACT */);
+            glBlendFunc(GL_ONE, GL_ONE);
+        } else {
+            gx_gl_blend_equation(0x8006 /* GL_FUNC_ADD */);
+            glBlendFunc(fac[(cm >> 8) & 7], dfac[(cm >> 5) & 7]);
+        }
     } else {
         glDisable(GL_BLEND);
     }
@@ -229,56 +360,80 @@ static void apply_blend_depth(void) {
     glColorMask((cm >> 3) & 1, (cm >> 3) & 1, (cm >> 3) & 1, (cm >> 4) & 1);
 }
 
-static int bind_texture0(void) {
-    uint32_t tref = bp[0x28];
-    int map = (int)(tref & 7);
-    if (!((tref >> 6) & 1)) { glDisable(GL_TEXTURE_2D); return 0; }
+static void bind_textures(void) {
     static const uint8_t img0[8] = {0x88, 0x89, 0x8A, 0x8B, 0xA8, 0xA9, 0xAA, 0xAB};
     static const uint8_t img3[8] = {0x94, 0x95, 0x96, 0x97, 0xB4, 0xB5, 0xB6, 0xB7};
     static const uint8_t tlut[8] = {0x98, 0x99, 0x9A, 0x9B, 0xB8, 0xB9, 0xBA, 0xBB};
     static const uint8_t mode0[8] = {0x80, 0x81, 0x82, 0x83, 0xA0, 0xA1, 0xA2, 0xA3};
-    uint32_t i0 = bp[img0[map]], i3 = bp[img3[map]], tl = bp[tlut[map]], m0 = bp[mode0[map]];
-    int w = (int)(i0 & 0x3FF) + 1, h = (int)((i0 >> 10) & 0x3FF) + 1, fmt = (int)((i0 >> 20) & 15);
-    uint32_t addr = 0x80000000u | ((i3 & 0x00FFFFFFu) << 5);
-    unsigned id = gx_tex_get(addr, w, h, fmt, (tl & 0x3FF) << 9, (int)((tl >> 10) & 3), tmem);
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, id);
-    static const GLint wrap[4] = {0x812F /* CLAMP_TO_EDGE */, GL_REPEAT, GL_REPEAT, GL_REPEAT};
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap[m0 & 3]);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap[(m0 >> 2) & 3]);
-    return 1;
+    int stages = (int)((bp[0x00] >> 10) & 15) + 1;
+    unsigned used = 0;
+    for (int i = 0; i < stages; i++) {
+        uint32_t tref = (bp[0x28 + i / 2] >> ((i & 1) * 12)) & 0xFFF;
+        if ((tref >> 6) & 1) used |= 1u << (tref & 7);
+    }
+    for (int map = 0; map < 8; map++) {
+        if (!(used & (1u << map))) continue;
+        uint32_t i0 = bp[img0[map]], i3 = bp[img3[map]], tl = bp[tlut[map]], m0 = bp[mode0[map]];
+        int w = (int)(i0 & 0x3FF) + 1, h = (int)((i0 >> 10) & 0x3FF) + 1, fmt = (int)((i0 >> 20) & 15);
+        uint32_t addr = 0x80000000u | ((i3 & 0x00FFFFFFu) << 5);
+        gx_gl_active_texture(map);
+        unsigned id = gx_tex_get(addr, w, h, fmt, (tl & 0x3FF) << 9, (int)((tl >> 10) & 3), tmem);
+        glBindTexture(GL_TEXTURE_2D, id);
+        static const GLint wrap[4] = {0x812F /* CLAMP_TO_EDGE */, GL_REPEAT, 0x8370 /* MIRRORED_REPEAT */, GL_REPEAT};
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap[m0 & 3]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap[(m0 >> 2) & 3]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, (m0 >> 4) & 1 ? GL_LINEAR : GL_NEAREST);
+    }
+    gx_gl_active_texture(0);
 }
 
-static void mat_color(float* o) {
-    uint32_t c = xf_mem[0x100C];
-    o[0] = (c >> 24) / 255.f; o[1] = ((c >> 16) & 255) / 255.f; o[2] = ((c >> 8) & 255) / 255.f; o[3] = (c & 255) / 255.f;
+// TEV color registers (PREV, C0..C2) and konst colors K0..K3, tracked from BP 0xE0..0xE7
+static float tev_reg[16], tev_konst[16];
+
+static void tev_reg_write(uint32_t reg, uint32_t val) {
+    int n = (int)((reg - 0xE0) >> 1), hi = (int)((reg - 0xE0) & 1);
+    float* dst = ((val >> 23) & 1) ? tev_konst : tev_reg;
+    int a = (int)(val & 0x7FF), b = (int)((val >> 12) & 0x7FF);
+    if (a & 0x400) a -= 0x800;
+    if (b & 0x400) b -= 0x800;
+    if (!hi) { dst[n * 4 + 0] = a / 255.f; dst[n * 4 + 3] = b / 255.f; }  // RA
+    else { dst[n * 4 + 2] = a / 255.f; dst[n * 4 + 1] = b / 255.f; }     // BG
 }
+
+#define MAX_DRAW_VERTS 65536
+static float a_pos[MAX_DRAW_VERTS * 4], a_col[2][MAX_DRAW_VERTS * 4], a_tex[8][MAX_DRAW_VERTS * 3];
 
 static void draw(int prim, int vat, int count, const uint8_t* data) {
     VtxFmt f;
     get_fmt(vat, &f);
     static const GLenum mode[8] = {GL_QUADS, GL_QUADS, GL_TRIANGLES, GL_TRIANGLE_STRIP,
                                    GL_TRIANGLE_FAN, GL_LINES, GL_LINE_STRIP, GL_POINTS};
-    apply_viewport();
-    apply_blend_depth();
-    int tex = bind_texture0();
-    uint32_t chan = xf_mem[0x100E];  // color0 control: bit0 = material from vertex
-    float mat[4];
-    mat_color(mat);
-    glBegin(mode[prim]);
+    if (count > MAX_DRAW_VERTS) count = MAX_DRAW_VERTS;
+    long long t0 = qpc();
     for (int i = 0; i < count; i++) {
         Vtx v;
+        OutVtx o;
         data = decode_vertex(data, &f, &v);
-        float c[4];
-        if ((chan & 1) && v.has_col) memcpy(c, v.col, sizeof(c));
-        else memcpy(c, mat, sizeof(c));
-        glColor4fv(c);
-        if (tex && v.has_tex) glTexCoord2f(v.tex[0], v.tex[1]);
-        float o[4];
-        transform(&v, o);
-        glVertex4fv(o);
+        process_vertex(&v, &o);
+        memcpy(&a_pos[i * 4], o.pos, 16);
+        memcpy(&a_col[0][i * 4], o.col[0], 16);
+        memcpy(&a_col[1][i * 4], o.col[1], 16);
+        for (int t = 0; t < 8; t++) memcpy(&a_tex[t][i * 3], o.tex[t], 12);
     }
-    glEnd();
+    long long t1 = qpc();
+    apply_viewport();
+    apply_blend_depth();
+    bind_textures();
+    uint32_t ac = bp[0xF3];
+    gx_shader_bind(bp, tev_konst, tev_reg, (ac & 255) / 255.f, ((ac >> 8) & 255) / 255.f);
+    gx_gl_attrib(0, 4, a_pos);
+    gx_gl_attrib(1, 4, a_col[0]);
+    gx_gl_attrib(2, 4, a_col[1]);
+    for (int t = 0; t < 8; t++) gx_gl_attrib(3 + t, 3, a_tex[t]);
+    long long t2 = qpc();
+    glDrawArrays(mode[prim], 0, count);
+    long long t3 = qpc();
+    t_decode += t1 - t0; t_state += t2 - t1; t_draw += t3 - t2;
     st.draws++;
     st.verts += (unsigned long long)count;
 }
@@ -301,6 +456,8 @@ static void bp_write(uint32_t v) {
         int to_xfb = (val >> 14) & 1, clear = (val >> 11) & 1;
         if (to_xfb) {
             st.frames++;
+            if (!st.t_first) st.t_first = GetTickCount64();
+            st.t_last = GetTickCount64();
             static int shot;
             char* dir = getenv("GX_SCREENSHOT_DIR");
             if (dir && (st.frames % 60 == 0) && shot < 20) {
@@ -327,6 +484,9 @@ static void bp_write(uint32_t v) {
         }
         break;
     }
+    case 0xE0: case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xE5: case 0xE6: case 0xE7:
+        tev_reg_write(reg, val);
+        break;
     case 0x65: {  // load TLUT: RAM (BP 0x64) -> TMEM
         uint32_t src = 0x80000000u | ((bp[0x64] & 0x1FFFFF) << 5);
         uint32_t dst = (val & 0x3FF) << 9, cnt = ((val >> 10) & 0x7FF) * 32;
@@ -447,7 +607,7 @@ static int (*next_read)(uint32_t, int, uint32_t*);
 
 static int write_hook(uint32_t off, uint32_t v, int size) {
     if ((off & 0xF000) == 0x8000) {
-        if (!gx_ready) { gx_win_open(); gx_ready = 1; }
+        if (!gx_ready) { gx_win_open(); gx_gl_load(); gx_ready = 1; }
         fifo_push(v, size);
         return 1;
     }
@@ -474,6 +634,11 @@ void gx_install(void) {
 }
 
 void gx_stats(void) {
-    fprintf(stderr, "gx: %llu commands, %llu draws, %llu vertices, %llu frames, %llu unknown bytes\n",
-            st.cmds, st.draws, st.verts, st.frames, st.unknown);
+    double secs = st.t_last > st.t_first ? (st.t_last - st.t_first) / 1000.0 : 0;
+    if (secs > 0) fprintf(stderr, "gx: %.1f fps average over %.1f s\n", (double)st.frames / secs, secs);
+    QueryPerformanceFrequency(&qpf);
+    fprintf(stderr, "gx: time in vertex processing %.1f s, state/shader/textures %.1f s, glDrawArrays %.1f s\n",
+            (double)t_decode / qpf.QuadPart, (double)t_state / qpf.QuadPart, (double)t_draw / qpf.QuadPart);
+    fprintf(stderr, "gx: %llu commands, %llu draws, %llu vertices, %llu frames, %llu unknown bytes, %d shaders\n",
+            st.cmds, st.draws, st.verts, st.frames, st.unknown, gx_shader_count());
 }

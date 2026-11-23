@@ -173,7 +173,19 @@ void ppc_syscall(PPCContext* ctx) {
     if (getenv("PPC_LOG_SC")) fprintf(stderr, "ppc: sc at lr=%08X\n", ctx->lr);
 }
 
-// Gekko time base runs at bus clock / 4 = 40.5 MHz; derive it from host time.
+// Gekko time base runs at bus clock / 4 = 40.5 MHz; derive it from the
+// host's high-resolution counter (cheap: this is called very often).
+#ifdef _WIN32
+#include <windows.h>
+uint64_t ppc_get_timebase(void) {
+    static LARGE_INTEGER t0, freq;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (!freq.QuadPart) { QueryPerformanceFrequency(&freq); t0 = now; }
+    uint64_t d = (uint64_t)(now.QuadPart - t0.QuadPart);
+    return d / (uint64_t)freq.QuadPart * 40500000ull + d % (uint64_t)freq.QuadPart * 40500000ull / (uint64_t)freq.QuadPart;
+}
+#else
 uint64_t ppc_get_timebase(void) {
     static struct timespec t0;
     static int init;
@@ -183,6 +195,7 @@ uint64_t ppc_get_timebase(void) {
     uint64_t ns = (uint64_t)(now.tv_sec - t0.tv_sec) * 1000000000ull + (uint64_t)(now.tv_nsec - t0.tv_nsec);
     return ns * 81 / 2000;  // 40.5 ticks per microsecond
 }
+#endif
 
 void ppc_ctx_init(PPCContext* ctx) {
     memset(ctx, 0, sizeof(*ctx));

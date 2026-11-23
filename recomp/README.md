@@ -95,8 +95,17 @@ reads its files from the disc and reaches the license screen
 - `gx_win.c` – Win32 window + OpenGL (legacy pipeline for this first version);
   `GX_SCREENSHOT_DIR=<dir>` saves a frame every second for debugging.
 
-Approximations: TEV is "vertex/material color × texture 0"; no lighting,
-texgen matrices, indirect textures, fog, scissor or render-to-texture yet.
+- `gx_shader.c` – TEV as generated GLSL (cached per configuration): up to 16
+  stages, all color/alpha inputs, konst colors and registers, bias/scale/
+  subtract/clamp, swap tables, alpha test.
+- Per-vertex on the CPU: position/normal matrices, lighting channels
+  (material/ambient sources, up to 8 lights, spot + distance attenuation),
+  texgen with texture matrices (ST/STQ, position/normal/texcoord sources).
+- Vertices are submitted as arrays; texture hashes are checked once per frame.
+
+Not yet: fog, indirect textures, specular lights, dual-tex (post) matrices,
+scissor, TEV compare modes, render-to-texture (EFB copies to RAM).
+`gx_stats` prints average fps and where GX time goes.
 
 ### Input (`boot/input.c`)
 

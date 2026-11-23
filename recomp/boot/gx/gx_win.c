@@ -16,6 +16,9 @@ static int quit_requested;
 
 static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_SYSCOMMAND:
+        if ((wp & 0xFFF0) == SC_CLOSE) fprintf(stderr, "gx: close requested from the window menu / Alt+F4\n");
+        return DefWindowProcA(h, msg, wp, lp);
     case WM_CLOSE: quit_requested = 1; return 0;
     case WM_SIZE: win_w = LOWORD(lp); win_h = HIWORD(lp); return 0;
     default: return DefWindowProcA(h, msg, wp, lp);

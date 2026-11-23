@@ -126,9 +126,9 @@ static void decode(uint32_t addr, int w, int h, int fmt, const uint8_t* tlut, in
 }
 
 typedef struct {
-    uint32_t addr, key2, hash;
+    uint32_t addr, key2, hash, tlut_tmem;
     unsigned id;
-    int used;
+    int checked_frame;  // hash verified during this frame
 } TexEntry;
 
 #define TEX_CACHE 512
@@ -154,16 +154,26 @@ unsigned gx_tex_get(uint32_t addr, int w, int h, int fmt, uint32_t tlut_tmem, in
     size_t n = tex_bytes(w, h, fmt);
     uint32_t key2 = (uint32_t)w | (uint32_t)h << 11 | (uint32_t)fmt << 22 | (uint32_t)tlut_fmt << 27;
     const uint8_t* tlut = tmem + (tlut_tmem & 0x7FFFF);
-    uint32_t hash = quick_hash(ppc_ptr(addr), n);
-    if (fmt == TF_C4 || fmt == TF_C8 || fmt == TF_C14X2) hash ^= quick_hash(tlut, fmt == TF_C4 ? 32 : 512) * 31u;
+    int paletted = fmt == TF_C4 || fmt == TF_C8 || fmt == TF_C14X2;
     int slot = (int)((addr >> 5) * 2654435761u % TEX_CACHE);
+    uint32_t hash = 0;
+    int hashed = 0;
     for (int i = 0; i < 8; i++) {
         TexEntry* e = &cache[(slot + i) % TEX_CACHE];
-        if (e->id && e->addr == addr && e->key2 == key2) {
+        if (e->id && e->addr == addr && e->key2 == key2 && (!paletted || e->tlut_tmem == tlut_tmem)) {
+            if (e->checked_frame == frame_counter) return e->id;  // already verified this frame
+            hash = quick_hash(ppc_ptr(addr), n);
+            if (paletted) hash ^= quick_hash(tlut, fmt == TF_C4 ? 32 : 512) * 31u;
+            hashed = 1;
+            e->checked_frame = frame_counter;
             if (e->hash == hash) return e->id;
             slot = (slot + i) % TEX_CACHE;
             goto upload;
         }
+    }
+    if (!hashed) {
+        hash = quick_hash(ppc_ptr(addr), n);
+        if (paletted) hash ^= quick_hash(tlut, fmt == TF_C4 ? 32 : 512) * 31u;
     }
     for (int i = 0; i < 8; i++) {
         TexEntry* e = &cache[(slot + i) % TEX_CACHE];
@@ -172,7 +182,7 @@ unsigned gx_tex_get(uint32_t addr, int w, int h, int fmt, uint32_t tlut_tmem, in
 upload : {
     TexEntry* e = &cache[slot];
     if (!e->id) glGenTextures(1, &e->id);
-    e->addr = addr; e->key2 = key2; e->hash = hash;
+    e->addr = addr; e->key2 = key2; e->hash = hash; e->tlut_tmem = tlut_tmem; e->checked_frame = frame_counter;
     uint8_t* rgba = (uint8_t*)malloc((size_t)w * h * 4);
     decode(addr, w, h, fmt, tlut, tlut_fmt, rgba);
     glBindTexture(GL_TEXTURE_2D, e->id);

@@ -71,7 +71,9 @@ static int setup_low_memory(const char* sysdir) {
     return 1;
 }
 
+extern unsigned long long hle_idle_ms;
 void boot_print_stats(void) {
+    fprintf(stderr, "boot: idle (all guest threads waiting) %.1f s\n", hle_idle_ms / 1000.0);
     hle_dvd_stats();
     gx_stats();
     ax_mix_stats();

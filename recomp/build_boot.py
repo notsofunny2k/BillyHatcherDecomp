@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-CFLAGS = ["-O1", "-std=c11", "-ffp-contract=off", "-fno-strict-aliasing",
+CFLAGS = ["-O2", "-std=c11", "-ffp-contract=off", "-fno-strict-aliasing",
           "-Wno-unused-label", "-Wno-parentheses-equality"]
 
 

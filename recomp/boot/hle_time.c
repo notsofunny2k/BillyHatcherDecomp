@@ -12,7 +12,8 @@
 #define AI_PERIOD (TB_PER_SEC / 200ull)              // 5 ms AX frame
 #define VI_DI0_HI 0x2030u                            // display interrupt 0, status bit 0x8000
 
-static uint64_t next_vi, next_ai;
+static uint64_t next_vi, next_ai, next_check;
+unsigned long long hle_idle_ms;
 
 static void raise_retrace(void) {
     ppc_mmio_set16(VI_DI0_HI, (uint16_t)(ppc_mmio_get16(VI_DI0_HI) | 0x8000u));
@@ -24,9 +25,12 @@ static void init_clocks(uint64_t now) {
     if (!next_ai) next_ai = now + AI_PERIOD;
 }
 
-// Raises timed interrupts that are due (cheap; called at interrupt-enable points).
+// Raises timed interrupts that are due. Called at every interrupt-enable
+// point (very often), so it only does real work about once per millisecond.
 void hle_time_poll(void) {
     uint64_t now = ppc_get_timebase();
+    if (now < next_check) return;
+    next_check = now + TB_PER_SEC / 1000;
     init_clocks(now);
     if (now >= next_vi) {
         next_vi += VI_PERIOD;
@@ -49,9 +53,10 @@ int hle_time_idle(void) {
     uint64_t next = next_vi < next_ai ? next_vi : next_ai;
     if (now < next) {
         uint64_t ms = (next - now) * 1000ull / TB_PER_SEC;
-        if (ms) Sleep((DWORD)ms);
+        if (ms) { Sleep((DWORD)ms); hle_idle_ms += ms; }
         while (ppc_get_timebase() < next) { /* spin the last fraction */ }
     }
+    next_check = 0;
     hle_time_poll();
     return 1;
 }
