@@ -59,6 +59,20 @@ Project status
   python tools/match_ref_objects.py build/sdkref orig/GEZE8P/sys/main.dol config/GEZE8P/symbols.txt --apply
   ```
 
+Ghidra
+======
+
+`tools/ghidra/ImportDtkSymbols.java` imports `config/GEZE8P/symbols.txt` into a Ghidra program (functions with dtk's boundaries, labels and names). Requires the [GameCube Loader](https://github.com/Cuyler36/Ghidra-GameCube-Loader) extension.
+
+Headless import + analysis:
+
+```sh
+analyzeHeadless <project_dir> BillyHatcher -import orig/GEZE8P/sys/main.dol -loader GameCubeLoader \
+  -scriptPath tools/ghidra -postScript ImportDtkSymbols.java config/GEZE8P/symbols.txt
+```
+
+In the GUI, add `tools/ghidra` in Script Manager → Script Directories and run `ImportDtkSymbols.java` again after renaming symbols in `symbols.txt`.
+
 Diffing
 =======
 
