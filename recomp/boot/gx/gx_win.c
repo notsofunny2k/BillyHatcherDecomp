@@ -1,4 +1,4 @@
-// Win32 window + legacy OpenGL context for the GX backend.
+﻿// Win32 window + legacy OpenGL context for the GX backend.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,7 +20,9 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if ((wp & 0xFFF0) == SC_CLOSE) fprintf(stderr, "gx: close requested from the window menu / Alt+F4\n");
         return DefWindowProcA(h, msg, wp, lp);
     case WM_CLOSE: quit_requested = 1; return 0;
-    case WM_SIZE: win_w = LOWORD(lp); win_h = HIWORD(lp); return 0;
+    case WM_SIZE:  // a minimized window reports 0x0: keep the last real size
+        if (wp != SIZE_MINIMIZED && LOWORD(lp) && HIWORD(lp)) { win_w = LOWORD(lp); win_h = HIWORD(lp); }
+        return 0;
     default: return DefWindowProcA(h, msg, wp, lp);
     }
 }

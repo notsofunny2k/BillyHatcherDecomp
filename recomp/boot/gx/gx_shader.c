@@ -32,6 +32,7 @@ FN(void, glUseProgram, (GLuint))
 FN(GLint, glGetUniformLocation, (GLuint, const GLchar*))
 FN(void, glUniform1i, (GLint, GLint))
 FN(void, glUniform4fv, (GLint, GLsizei, const GLfloat*))
+FN(void, glUniform1fv, (GLint, GLsizei, const GLfloat*))
 FN(void, glActiveTexture, (GLenum))
 FN(void, glVertexAttribPointer, (GLuint, GLint, GLenum, GLboolean, GLsizei, const void*))
 FN(void, glEnableVertexAttribArray, (GLuint))
@@ -49,7 +50,7 @@ int gx_gl_load(void) {
     LOAD(glCreateShader) LOAD(glShaderSource) LOAD(glCompileShader) LOAD(glGetShaderiv)
     LOAD(glGetShaderInfoLog) LOAD(glCreateProgram) LOAD(glAttachShader) LOAD(glBindAttribLocation)
     LOAD(glLinkProgram) LOAD(glGetProgramiv) LOAD(glGetProgramInfoLog) LOAD(glUseProgram)
-    LOAD(glGetUniformLocation) LOAD(glUniform1i) LOAD(glUniform4fv) LOAD(glActiveTexture)
+    LOAD(glGetUniformLocation) LOAD(glUniform1i) LOAD(glUniform4fv) LOAD(glUniform1fv) LOAD(glActiveTexture)
     LOAD(glVertexAttribPointer) LOAD(glEnableVertexAttribArray) LOAD(glDisableVertexAttribArray)
     LOAD(glBlendEquation)
     loaded = ok ? 1 : -1;
@@ -124,6 +125,7 @@ static void gen_fs(const uint32_t* bp, char* s, size_t cap) {
     P("#version 120\n");
     P("varying vec4 v_col0, v_col1; varying vec3 v_tex[8];\n");
     P("uniform sampler2D s_tex[8]; uniform vec4 u_k[4]; uniform vec4 u_reg[4]; uniform vec4 u_aref;\n");
+    P("uniform vec4 u_fog; uniform vec4 u_fogcol; uniform vec4 u_vpz; uniform float u_flip[8];\n");
     P("void main() {\n");
     P("  vec4 prev = u_reg[0], c0 = u_reg[1], c1 = u_reg[2], c2 = u_reg[3];\n");
     P("  vec4 tex, ras; vec3 kc; float ka;\n");
@@ -137,7 +139,8 @@ static void gen_fs(const uint32_t* bp, char* s, size_t cap) {
         swap_str(bp, (int)(ae & 3), rs);
         swap_str(bp, (int)((ae >> 2) & 3), ts);
         P("  // stage %d\n", i);
-        if (en) P("  tex = texture2DProj(s_tex[%d], v_tex[%d]).%s;\n", map, coord, ts);
+        if (en) P("  tex = texture2DProj(s_tex[%d], vec3(v_tex[%d].x, mix(v_tex[%d].y, v_tex[%d].z - v_tex[%d].y, u_flip[%d]), v_tex[%d].z)).%s;\n",
+                  map, coord, coord, coord, coord, map, coord, ts);
         else P("  tex = vec4(1.0);\n");
         if (chan == 0) P("  ras = v_col0.%s;\n", rs);
         else if (chan == 1) P("  ras = v_col1.%s;\n", rs);
@@ -181,6 +184,21 @@ static void gen_fs(const uint32_t* bp, char* s, size_t cap) {
         if (!(c0f == 7 && c1f == 7 && logic == 0))
             P("  if (!(%s %s %s)) discard;\n", e0, lg[logic], e1);
     }
+    // fog (BP 0xEE-0xF2): ze from the 24-bit window depth, like the GX pixel engine
+    {
+        int fsel = (int)((bp[0xF1] >> 21) & 7), ortho = (int)((bp[0xF1] >> 20) & 1);
+        if (fsel) {
+            P("  { float zc = (gl_FragCoord.z - 1.0) * u_vpz.x + u_vpz.y;\n");
+            if (!ortho) P("    float ze = (u_fog.x * 16777216.0) / (u_fog.z - floor(zc / u_fog.w));\n");
+            else P("    float ze = u_fog.x * zc / 16777216.0;\n");
+            P("    float f = clamp(ze - u_fog.y, 0.0, 1.0);\n");
+            if (fsel == 4) P("    f = 1.0 - exp2(-8.0 * f);\n");
+            else if (fsel == 5) P("    f = 1.0 - exp2(-8.0 * f * f);\n");
+            else if (fsel == 6) P("    f = exp2(-8.0 * (1.0 - f));\n");
+            else if (fsel == 7) P("    f = 1.0 - f; f = exp2(-8.0 * f * f);\n");
+            P("    prev.rgb = mix(prev.rgb, u_fogcol.rgb, f); }\n");
+        }
+    }
     P("  gl_FragColor = clamp(prev, 0.0, 1.0);\n}\n");
 #undef P
 }
@@ -193,6 +211,7 @@ static int make_key(const uint32_t* bp, uint32_t* key) {
     for (int i = 0; i < stages; i++) { key[n++] = bp[0xC0 + 2 * i]; key[n++] = bp[0xC1 + 2 * i]; }
     for (int i = 0; i < 8; i++) key[n++] = bp[0xF6 + i];
     key[n++] = bp[0xF3] & 0xFF0000u;  // compare functions + logic (refs are uniforms)
+    key[n++] = bp[0xF1] & 0xF00000u;  // fog type + projection
     return n;
 }
 
@@ -200,7 +219,7 @@ typedef struct {
     uint32_t key[64];
     int klen;
     GLuint prog;
-    GLint u_k, u_reg, u_aref;
+    GLint u_k, u_reg, u_aref, u_fog, u_fogcol, u_vpz, u_flip;
 } Prog;
 
 #define NPROG 1024
@@ -225,7 +244,8 @@ static GLuint compile(GLenum type, const char* src) {
 static GLuint vs_obj;
 
 // Activates the program for the current TEV state and loads its uniforms.
-int gx_shader_bind(const uint32_t* bp, const float k[16], const float reg[16], float aref0, float aref1) {
+int gx_shader_bind(const uint32_t* bp, const float k[16], const float reg[16], float aref0, float aref1,
+                   const float fog[4], const float fogcol[4], const float vpz[4], const float flip[8]) {
     uint32_t key[64];
     int klen = make_key(bp, key);
     uint32_t h = 2166136261u;
@@ -269,6 +289,10 @@ int gx_shader_bind(const uint32_t* bp, const float k[16], const float reg[16], f
         p->u_k = p_glGetUniformLocation(prog, "u_k");
         p->u_reg = p_glGetUniformLocation(prog, "u_reg");
         p->u_aref = p_glGetUniformLocation(prog, "u_aref");
+        p->u_fog = p_glGetUniformLocation(prog, "u_fog");
+        p->u_fogcol = p_glGetUniformLocation(prog, "u_fogcol");
+        p->u_vpz = p_glGetUniformLocation(prog, "u_vpz");
+        p->u_flip = p_glGetUniformLocation(prog, "u_flip");
         nprogs++;
         compiles++;
     }
@@ -277,6 +301,12 @@ int gx_shader_bind(const uint32_t* bp, const float k[16], const float reg[16], f
     p_glUniform4fv(p->u_reg, 4, reg);
     float ar[4] = {aref0, aref1, 0, 0};
     p_glUniform4fv(p->u_aref, 1, ar);
+    if (p->u_flip >= 0) p_glUniform1fv(p->u_flip, 8, flip);
+    if (p->u_fog >= 0) {
+        p_glUniform4fv(p->u_fog, 1, fog);
+        p_glUniform4fv(p->u_fogcol, 1, fogcol);
+        p_glUniform4fv(p->u_vpz, 1, vpz);
+    }
     return 1;
 }
 

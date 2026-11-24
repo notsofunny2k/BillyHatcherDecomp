@@ -28,6 +28,7 @@ static struct {
 } st;
 
 static int gx_ready;
+static unsigned long long n_fog_draws, n_ind_draws, n_efb_tex_copies, n_scissor_changes, n_zcomp_tex;
 static LARGE_INTEGER qpf;
 static long long t_draw, t_decode, t_state;
 static long long qpc(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
@@ -330,6 +331,19 @@ static void apply_viewport(void) {
     glViewport((GLint)(left * kx), (GLint)((480.0f - (top + h)) * ky), (GLsizei)(w * kx), (GLsizei)(h * ky));
 }
 
+// Scissor rectangle (BP 0x20/0x21, offset BP 0x59), in EFB pixels.
+static void apply_scissor(void) {
+    int ww, wh;
+    gx_win_size(&ww, &wh);
+    int xoff = (int)(bp[0x59] & 0x3FF) * 2, yoff = (int)((bp[0x59] >> 10) & 0x3FF) * 2;
+    int x0 = (int)((bp[0x20] >> 12) & 0x7FF) - xoff, y0 = (int)(bp[0x20] & 0x7FF) - yoff;
+    int x1 = (int)((bp[0x21] >> 12) & 0x7FF) - xoff + 1, y1 = (int)(bp[0x21] & 0x7FF) - yoff + 1;
+    if (x1 <= x0 || y1 <= y0) { glDisable(GL_SCISSOR_TEST); return; }
+    float kx = (float)ww / 640.0f, ky = (float)wh / 480.0f;
+    glEnable(GL_SCISSOR_TEST);
+    glScissor((GLint)(x0 * kx), (GLint)((480 - y1) * ky), (GLsizei)((x1 - x0) * kx), (GLsizei)((y1 - y0) * ky));
+}
+
 static void apply_blend_depth(void) {
     uint32_t cm = bp[0x41];
     if (cm & 1) {
@@ -360,6 +374,8 @@ static void apply_blend_depth(void) {
     glColorMask((cm >> 3) & 1, (cm >> 3) & 1, (cm >> 3) & 1, (cm >> 4) & 1);
 }
 
+static float tex_flip[8];  // 1 = texture map comes from an EFB copy (GL origin)
+
 static void bind_textures(void) {
     static const uint8_t img0[8] = {0x88, 0x89, 0x8A, 0x8B, 0xA8, 0xA9, 0xAA, 0xAB};
     static const uint8_t img3[8] = {0x94, 0x95, 0x96, 0x97, 0xB4, 0xB5, 0xB6, 0xB7};
@@ -377,7 +393,9 @@ static void bind_textures(void) {
         int w = (int)(i0 & 0x3FF) + 1, h = (int)((i0 >> 10) & 0x3FF) + 1, fmt = (int)((i0 >> 20) & 15);
         uint32_t addr = 0x80000000u | ((i3 & 0x00FFFFFFu) << 5);
         gx_gl_active_texture(map);
-        unsigned id = gx_tex_get(addr, w, h, fmt, (tl & 0x3FF) << 9, (int)((tl >> 10) & 3), tmem);
+        unsigned id = gx_tex_efb_lookup(addr);
+        tex_flip[map] = id ? 1.f : 0.f;
+        if (!id) id = gx_tex_get(addr, w, h, fmt, (tl & 0x3FF) << 9, (int)((tl >> 10) & 3), tmem);
         glBindTexture(GL_TEXTURE_2D, id);
         static const GLint wrap[4] = {0x812F /* CLAMP_TO_EDGE */, GL_REPEAT, 0x8370 /* MIRRORED_REPEAT */, GL_REPEAT};
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap[m0 & 3]);
@@ -400,6 +418,25 @@ static void tev_reg_write(uint32_t reg, uint32_t val) {
     else { dst[n * 4 + 2] = a / 255.f; dst[n * 4 + 1] = b / 255.f; }     // BG
 }
 
+// fog uniforms from BP 0xEE-0xF2 (A and C are 20-bit floats: 11-bit mantissa)
+static float gx_float20(uint32_t v) {
+    uint32_t bits = ((v >> 19) & 1u) << 31 | ((v >> 11) & 0xFFu) << 23 | (v & 0x7FFu) << 12;
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
+static void shader_bind_current(void) {
+    uint32_t ac = bp[0xF3];
+    float fog[4] = {gx_float20(bp[0xEE]), gx_float20(bp[0xF1]), (float)(bp[0xEF] & 0xFFFFFF),
+                    (float)(1u << (bp[0xF0] & 31))};
+    if (fog[2] == 0) fog[2] = 1;
+    uint32_t fc = bp[0xF2];
+    float fogcol[4] = {((fc >> 16) & 255) / 255.f, ((fc >> 8) & 255) / 255.f, (fc & 255) / 255.f, 1};
+    float vpz[4] = {xf_f(0x101C), xf_f(0x101F), 0, 0};
+    gx_shader_bind(bp, tev_konst, tev_reg, (ac & 255) / 255.f, ((ac >> 8) & 255) / 255.f, fog, fogcol, vpz, tex_flip);
+}
+
 // ---- batching -------------------------------------------------------------
 // Consecutive draws with the same render state are converted to triangles and
 // accumulated; the batch is submitted only when render state changes (BP
@@ -414,10 +451,10 @@ static void gx_flush(void) {
     if (!batch_n) return;
     long long t1 = qpc();
     apply_viewport();
+    apply_scissor();
     apply_blend_depth();
     bind_textures();
-    uint32_t ac = bp[0xF3];
-    gx_shader_bind(bp, tev_konst, tev_reg, (ac & 255) / 255.f, ((ac >> 8) & 255) / 255.f);
+    shader_bind_current();
     gx_gl_attrib(0, 4, a_pos);
     gx_gl_attrib(1, 4, a_col[0]);
     gx_gl_attrib(2, 4, a_col[1]);
@@ -447,10 +484,10 @@ static void draw_direct(GLenum mode, int count) {
     gx_flush();
     for (int i = 0; i < count; i++) put_vertex(&tmp_v[i]);
     apply_viewport();
+    apply_scissor();
     apply_blend_depth();
     bind_textures();
-    uint32_t ac = bp[0xF3];
-    gx_shader_bind(bp, tev_konst, tev_reg, (ac & 255) / 255.f, ((ac >> 8) & 255) / 255.f);
+    shader_bind_current();
     gx_gl_attrib(0, 4, a_pos);
     gx_gl_attrib(1, 4, a_col[0]);
     gx_gl_attrib(2, 4, a_col[1]);
@@ -460,6 +497,8 @@ static void draw_direct(GLenum mode, int count) {
 }
 
 static void draw(int prim, int vat, int count, const uint8_t* data) {
+    if ((bp[0xF1] >> 21) & 7) n_fog_draws++;      // fog type (FOG_PARAM3 bits 21-23)
+    if ((bp[0x00] >> 16) & 7) n_ind_draws++;      // GenMode: number of indirect stages
     VtxFmt f;
     get_fmt(vat, &f);
     if (count > MAX_DRAW_VERTS) count = MAX_DRAW_VERTS;
@@ -521,11 +560,23 @@ static void bp_write(uint32_t v) {
     if (nv != bp[reg] || reg == 0x45 || reg == 0x47 || reg == 0x48 || reg == 0x52 || reg == 0x65) gx_flush();
     bp[reg] = nv;
     switch (reg) {
+    case 0x20: case 0x21: n_scissor_changes++; break;
     case 0x45: pe_raise(1, 0); break;                        // draw done
     case 0x47: pe_raise(0, (uint16_t)(val & 0xFFFF)); break;  // token (no irq)
     case 0x48: pe_raise(2, (uint16_t)(val & 0xFFFF)); break;  // token + irq
     case 0x52: {                                              // EFB copy
         int to_xfb = (val >> 14) & 1, clear = (val >> 11) & 1;
+        if (!to_xfb) n_efb_tex_copies++;
+        if (!to_xfb) {
+            int ww, wh;
+            gx_win_size(&ww, &wh);
+            float kx = (float)ww / 640.0f, ky = (float)wh / 480.0f;
+            int x = (int)(bp[0x49] & 0x3FF), y = (int)((bp[0x49] >> 10) & 0x3FF);
+            int w = (int)(bp[0x4A] & 0x3FF) + 1, h = (int)((bp[0x4A] >> 10) & 0x3FF) + 1;
+            uint32_t dst = 0x80000000u | ((bp[0x4B] & 0x1FFFFF) << 5);
+            glDisable(GL_SCISSOR_TEST);
+            gx_tex_efb_copy(dst, (int)(x * kx), (int)((480 - y - h) * ky), (int)(w * kx), (int)(h * ky));
+        }
         if (to_xfb) {
             st.frames++;
             if (!st.t_first) st.t_first = GetTickCount64();
@@ -567,6 +618,7 @@ static void bp_write(uint32_t v) {
             int ww, wh;
             gx_win_size(&ww, &wh);
             glViewport(0, 0, ww, wh);
+            glDisable(GL_SCISSOR_TEST);
             glClearColor(r, g, b, a);
             glClearDepth(1.0);
             glColorMask(1, 1, 1, 1);
@@ -729,6 +781,8 @@ void gx_install(void) {
 }
 
 void gx_stats(void) {
+    fprintf(stderr, "gx: missing features used: fog draws %llu, indirect draws %llu, EFB->texture copies %llu, scissor changes %llu\n",
+            n_fog_draws, n_ind_draws, n_efb_tex_copies, n_scissor_changes);
     double secs = st.t_last > st.t_first ? (st.t_last - st.t_first) / 1000.0 : 0;
     if (secs > 0) fprintf(stderr, "gx: %.1f fps average over %.1f s\n", (double)st.frames / secs, secs);
     QueryPerformanceFrequency(&qpf);

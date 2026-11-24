@@ -14,13 +14,16 @@ void gx_win_screenshot(const char* path);
 unsigned gx_tex_get(uint32_t addr, int w, int h, int fmt, uint32_t tlut_tmem, int tlut_fmt,
                     const uint8_t* tmem);
 void gx_tex_invalidate(void);
+void gx_tex_efb_copy(uint32_t addr, int x, int y, int w, int h);  // window pixels
+unsigned gx_tex_efb_lookup(uint32_t addr);
 
 // shaders / modern GL entry points (gx_shader.c)
 int gx_gl_load(void);
 void gx_gl_active_texture(int unit);
 void gx_gl_blend_equation(unsigned e);
 void gx_gl_attrib(int idx, int size, const float* data);
-int gx_shader_bind(const uint32_t* bp, const float k[16], const float reg[16], float aref0, float aref1);
+int gx_shader_bind(const uint32_t* bp, const float k[16], const float reg[16], float aref0, float aref1,
+                   const float fog[4], const float fogcol[4], const float vpz[4], const float flip[8]);
 int gx_shader_count(void);
 
 // boot_main.c: prints DVD/GX/audio/thread statistics

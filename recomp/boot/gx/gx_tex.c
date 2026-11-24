@@ -150,6 +150,36 @@ static size_t tex_bytes(int w, int h, int fmt) {
 
 void gx_tex_invalidate(void) { frame_counter++; }
 
+// ---- EFB copies used as textures ------------------------------------------
+// The copy stays on the GPU; a later texture at the same RAM address uses it.
+typedef struct { uint32_t addr; unsigned id; int frame; } EfbTex;
+static EfbTex efb[64];
+
+void gx_tex_efb_copy(uint32_t addr, int x, int y, int w, int h) {
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < 64; i++) {
+        if (efb[i].id && efb[i].addr == addr) { slot = i; break; }
+        if (!efb[i].id && slot < 0) slot = i;
+        if (efb[i].frame < efb[oldest].frame) oldest = i;
+    }
+    if (slot < 0) slot = oldest;
+    EfbTex* e = &efb[slot];
+    if (!e->id) glGenTextures(1, &e->id);
+    e->addr = addr;
+    e->frame = frame_counter;
+    glBindTexture(GL_TEXTURE_2D, e->id);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, x, y, w, h, 0);
+}
+
+// Returns the GL texture of an EFB copy at addr (0 if none).
+unsigned gx_tex_efb_lookup(uint32_t addr) {
+    for (int i = 0; i < 64; i++)
+        if (efb[i].id && efb[i].addr == addr) return efb[i].id;
+    return 0;
+}
+
 unsigned gx_tex_get(uint32_t addr, int w, int h, int fmt, uint32_t tlut_tmem, int tlut_fmt, const uint8_t* tmem) {
     size_t n = tex_bytes(w, h, fmt);
     uint32_t key2 = (uint32_t)w | (uint32_t)h << 11 | (uint32_t)fmt << 22 | (uint32_t)tlut_fmt << 27;
