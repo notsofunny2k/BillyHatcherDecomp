@@ -106,8 +106,14 @@ reads its files from the disc and reaches the license screen
   syncs (title screen: ~5000 draws per frame in ~250 batches).
 - Texture hashes are checked once per frame. `GX_FPS=1` prints fps every 5 s.
 
-Not yet: fog, indirect textures, specular lights, dual-tex (post) matrices,
-scissor, TEV compare modes, render-to-texture (EFB copies to RAM).
+- Fog (BP 0xEE-0xF2): linear/exp/exp2 and back variants, perspective and
+  orthographic, from the 24-bit window depth like the pixel engine.
+- Scissor (BP 0x20/0x21 + offset 0x59).
+- EFB copies to texture stay on the GPU (`glCopyTexImage2D`); a later texture
+  at the destination address uses the copy (flipped vertically in the shader).
+
+Not yet: indirect textures, specular lights, dual-tex (post) matrices,
+TEV compare modes, EFB copies written back to RAM (CPU reads of copies).
 `gx_stats` prints average fps and where GX time goes.
 
 ### Input (`boot/input.c`)
@@ -187,14 +193,17 @@ Not yet: aux buses (reverb/chorus), surround, ITD, low-pass filter,
   module list (`0x800030C8`), reads the section addresses OSLink assigned and
   registers the module's functions at their real addresses.
 
-Current state: boot logos, license and title screens render; START on the
-title opens the main menu (`k_main_menu.prd`).
+## Current state
+
+Boot, license, title and main menu; a new game plays the intro and runs the
+first stage (`k_green1.prd`) at ~58 fps with sound, input and memory card
+saves. Not yet checked: playing through a stage by hand.
 
 ## Not done yet
 
-- Full TEV / lighting / render-to-texture.
-- Audio: AX runs without a DSP (silent); AI/ADX output not mixed.
-- Input: the pad is always neutral (SDL planned).
-- Alarms (`OSSetAlarm`) / decrementer are not emulated yet.
+- GX: indirect textures, specular lights, dual-tex matrices, TEV compare
+  modes, EFB copies read back by the CPU.
+- Audio: aux buses (reverb/chorus), polyphase SRC, low-pass filter.
+- Memory card slot B; RTC/SRAM contents (read as zero).
 - FPSCR rounding modes / exceptions are ignored.
-- `movie_module.rel` is not translated yet.
+- Host platforms other than Windows (the runtime uses Win32, WGL, waveOut).
