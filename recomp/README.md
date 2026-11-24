@@ -146,6 +146,18 @@ Not yet: aux buses (reverb/chorus), surround, ITD, low-pass filter,
 
 `GX_WINDOW=background` opens the window minimized without taking focus.
 
+### Performance notes
+
+- `PPC_PROFILE=1`: sampling profiler (1 ms) mapping the host instruction
+  pointer to the translated guest function; prints the top 30 on exit.
+- On the title screen translated game code is ~7% of CPU time; the game is
+  idle ~35-40% of the time waiting for the next retrace. GX is ~6 ms/frame.
+- The runtime sets a 1 ms timer resolution (`timeBeginPeriod`): with the
+  default ~15.6 ms granularity, waits for the next retrace overslept and
+  dropped frames.
+- `GX_SCREENSHOT_DIR` itself costs a lot (GPU readback + BMP write): don't
+  measure fps with it enabled.
+
 ### REL modules
 
 `ppc2c.py --rel module.rel=symbols.txt` translates a REL linked at runtime:

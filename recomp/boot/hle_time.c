@@ -1,4 +1,4 @@
-// Guest time and timed events: VI retrace (59.94 Hz) and the AI DMA
+﻿// Guest time and timed events: VI retrace (59.94 Hz) and the AI DMA
 // interrupt that drives AX audio frames (every 5 ms).
 #include <windows.h>
 
@@ -53,7 +53,7 @@ int hle_time_idle(void) {
     uint64_t next = next_vi < next_ai ? next_vi : next_ai;
     if (now < next) {
         uint64_t ms = (next - now) * 1000ull / TB_PER_SEC;
-        if (ms) { Sleep((DWORD)ms); hle_idle_ms += ms; }
+        if (ms > 1) { Sleep((DWORD)(ms - 1)); hle_idle_ms += ms - 1; }  // spin the last ms
         while (ppc_get_timebase() < next) { /* spin the last fraction */ }
     }
     next_check = 0;

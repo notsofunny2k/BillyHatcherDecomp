@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include <windows.h>
+#include <mmsystem.h>
 
 #include "audio/audio.h"
 #include "gx/gx_internal.h"
@@ -72,7 +73,10 @@ static int setup_low_memory(const char* sysdir) {
 }
 
 extern unsigned long long hle_idle_ms;
+void profiler_start(void);
+void profiler_report(void);
 void boot_print_stats(void) {
+    profiler_report();
     fprintf(stderr, "boot: idle (all guest threads waiting) %.1f s\n", hle_idle_ms / 1000.0);
     hle_dvd_stats();
     gx_stats();
@@ -132,8 +136,15 @@ int main(int argc, char** argv) {
     ppc_ctx_init(&ctx);
     ctx.msr = 0x00002032u;  // FP available, IR/DR on, like after the IPL
 
+    // 1 ms timer resolution: waits for the next retrace must not oversleep
+
+    // (the default ~15.6 ms granularity drops frames).
+
+    timeBeginPeriod(1);
+
     ppc_raise_irq = hle_irq_raise;
     CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
+    profiler_start();
     fprintf(stderr, "boot: entry %08X (%s)\n", entry, ppc_func_name(entry));
     ppc_call_indirect(&ctx, entry);
     fprintf(stderr, "boot: entry point returned (r3=%08X)\n", ctx.r[3]);
