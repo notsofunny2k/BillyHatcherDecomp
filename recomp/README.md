@@ -158,6 +158,22 @@ Not yet: aux buses (reverb/chorus), surround, ITD, low-pass filter,
 - `GX_SCREENSHOT_DIR` itself costs a lot (GPU readback + BMP write): don't
   measure fps with it enabled.
 
+### Alarms and memory card
+
+- `hle_alarm.c`: `OSSetAlarm` / `InsertAlarm` (periodic alarms too) /
+  `OSCancelAlarm` keep a native list; due handlers run as deferred guest calls
+  at the next interrupt delivery point, and alarms wake the idle scheduler.
+- `exi_card.c`: EXI bus with a memory card in slot A (2 MB / 251 blocks, raw
+  image compatible with Dolphin's `.raw` cards, default
+  `build/memcard/MemoryCardA.raw`, override with `PPC_MEMCARD_A`, disable with
+  `PPC_NO_MEMCARD`). The CARD library runs translated on the emulated device
+  protocol (ID, status, read, page program, sector/chip erase, EXI and
+  transfer-complete interrupts). Only `__CARDUnlock` (DSP challenge) is
+  native. `EXI_LOG=1` prints every card command.
+- Verified: a blank card is formatted by the game, which then creates its
+  save file (`GEZE8P billyhatcher`, 2 blocks); a second run mounts it and
+  reads the save without reformatting.
+
 ### REL modules
 
 `ppc2c.py --rel module.rel=symbols.txt` translates a REL linked at runtime:

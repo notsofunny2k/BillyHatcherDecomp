@@ -28,27 +28,59 @@ static int masked(int n) {
     return (m & (0x80000000u >> n)) != 0;
 }
 
+uint32_t hle_find_function(const char* name) {
+    for (size_t i = 0; i < ppc_func_table_size; i++)
+        if (ppc_func_table[i].name && !strcmp(ppc_func_table[i].name, name)) return ppc_func_table[i].addr;
+    return 0;
+}
+
+// ---- deferred guest calls ------------------------------------------------
+// Native device code that must call back into the game "later" (as hardware
+// completion would) queues the call here; it runs at the next delivery point
+// like an interrupt handler.
+typedef struct { uint32_t fn, r3, r4, r5; } Deferred;
+static Deferred dq[64];
+static int dq_head, dq_tail;
+
+void hle_defer_call(uint32_t fn, uint32_t r3, uint32_t r4, uint32_t r5) {
+    int next = (dq_tail + 1) % 64;
+    if (next == dq_head) { fprintf(stderr, "irq: deferred call queue full\n"); return; }
+    dq[dq_tail].fn = fn; dq[dq_tail].r3 = r3; dq[dq_tail].r4 = r4; dq[dq_tail].r5 = r5;
+    dq_tail = next;
+}
+
+static void run_guest(PPCContext* ctx, uint32_t fn, uint32_t r3, uint32_t r4, uint32_t r5) {
+    static PPCContext saved;
+    memcpy(&saved, ctx, sizeof(saved));
+    in_irq = 1;
+    ctx->msr &= ~MSR_EE;
+    ctx->r[1] -= 0x200;  // stay clear of the interrupted code's red zone
+    ctx->r[3] = r3;
+    ctx->r[4] = r4;
+    ctx->r[5] = r5;
+    ctx->lr = 0;
+    ppc_call_indirect(ctx, fn);
+    in_irq = 0;
+    memcpy(ctx, &saved, sizeof(saved));
+}
+
 // Runs pending, unmasked interrupts on ctx. Returns how many ran.
 int hle_irq_deliver(PPCContext* ctx) {
     if (in_irq) return 0;
     hle_time_poll();
     int ran = 0;
+    while (dq_head != dq_tail) {
+        Deferred d = dq[dq_head];
+        dq_head = (dq_head + 1) % 64;
+        run_guest(ctx, d.fn, d.r3, d.r4, d.r5);
+        ran++;
+    }
     for (int n = 0; n < 32 && pending; n++) {
         if (!(pending & (1u << n)) || masked(n)) continue;
         uint32_t handler = ld32(OS_INTERRUPT_TABLE + 4u * (uint32_t)n);
         pending &= ~(1u << n);
         if (!handler) continue;
-        static PPCContext saved;
-        memcpy(&saved, ctx, sizeof(saved));
-        in_irq = 1;
-        ctx->msr &= ~MSR_EE;
-        ctx->r[1] -= 0x200;  // stay clear of the interrupted code's red zone
-        ctx->r[3] = (uint32_t)n;
-        ctx->r[4] = IRQ_CONTEXT;
-        ctx->lr = 0;
-        ppc_call_indirect(ctx, handler);
-        in_irq = 0;
-        memcpy(ctx, &saved, sizeof(saved));
+        run_guest(ctx, handler, (uint32_t)n, IRQ_CONTEXT, 0);
         ran++;
     }
     if (ran) hle_thread_reschedule();
@@ -56,6 +88,7 @@ int hle_irq_deliver(PPCContext* ctx) {
 }
 
 int hle_irq_pending(void) {
+    if (dq_head != dq_tail) return 1;
     for (int n = 0; n < 32; n++)
         if ((pending & (1u << n)) && !masked(n) && ld32(OS_INTERRUPT_TABLE + 4u * (uint32_t)n)) return 1;
     return 0;

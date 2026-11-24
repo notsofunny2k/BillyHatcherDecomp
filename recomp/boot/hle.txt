@@ -15,6 +15,12 @@ RealMode
 OSDisableInterrupts
 OSEnableInterrupts
 OSRestoreInterrupts
+# Alarms (hle_alarm.c)
+InsertAlarm
+OSSetAlarm
+OSCancelAlarm
+# Memory card unlock needs the DSP: replaced (exi_card.c)
+__CARDUnlock
 # Threads: native scheduler on fibers (hle_thread.c)
 OSCreateThread
 OSResumeThread

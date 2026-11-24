@@ -75,7 +75,12 @@ static int setup_low_memory(const char* sysdir) {
 extern unsigned long long hle_idle_ms;
 void profiler_start(void);
 void profiler_report(void);
+void hle_alarm_stats(void);
+void exi_stats(void);
+void exi_install(void);
 void boot_print_stats(void) {
+    hle_alarm_stats();
+    exi_stats();
     profiler_report();
     fprintf(stderr, "boot: idle (all guest threads waiting) %.1f s\n", hle_idle_ms / 1000.0);
     hle_dvd_stats();
@@ -127,6 +132,7 @@ int main(int argc, char** argv) {
     }
     hle_dvd_install();
     gx_install();  // chains after the DVD hooks
+    exi_install();  // EXI bus + memory card A (chains after GX)
     uint32_t entry = 0;
     if (!ppc_mem_init() || !ppc_load_dol(argv[1], &entry)) {
         fprintf(stderr, "boot: could not load %s\n", argv[1]);

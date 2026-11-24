@@ -1,4 +1,4 @@
-// GX command processor: consumes the write-gather pipe stream (0xCC008000),
+﻿// GX command processor: consumes the write-gather pipe stream (0xCC008000),
 // tracks CP / XF / BP register state and draws primitives with OpenGL.
 // Vertices are transformed, lit and texgen'd on the CPU; TEV runs as
 // generated GLSL (gx_shader.c). No fog, indirect textures or render-to-texture yet.
@@ -551,7 +551,7 @@ static void bp_write(uint32_t v) {
             }
             static int shot;
             char* dir = getenv("GX_SCREENSHOT_DIR");
-            if (dir && (st.frames % 60 == 0) && shot < 20) {
+            if (dir && (st.frames % 60 == 0) && shot < 200) {
                 char path[512];
                 snprintf(path, sizeof(path), "%s/frame_%05llu.bmp", dir, st.frames);
                 gx_win_screenshot(path);

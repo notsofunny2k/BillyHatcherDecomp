@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include "audio/audio.h"
+#include "hle_alarm.h"
 #include "hle_irq.h"
 #include "hle_time.h"
 #include "ppc_runtime.h"
@@ -31,6 +32,7 @@ void hle_time_poll(void) {
     uint64_t now = ppc_get_timebase();
     if (now < next_check) return;
     next_check = now + TB_PER_SEC / 1000;
+    hle_alarm_poll(now);
     init_clocks(now);
     if (now >= next_vi) {
         next_vi += VI_PERIOD;
@@ -51,6 +53,8 @@ int hle_time_idle(void) {
     uint64_t now = ppc_get_timebase();
     init_clocks(now);
     uint64_t next = next_vi < next_ai ? next_vi : next_ai;
+    uint64_t na = hle_alarm_next();
+    if (na < next) next = na;
     if (now < next) {
         uint64_t ms = (next - now) * 1000ull / TB_PER_SEC;
         if (ms > 1) { Sleep((DWORD)(ms - 1)); hle_idle_ms += ms - 1; }  // spin the last ms

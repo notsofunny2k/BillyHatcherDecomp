@@ -5,6 +5,9 @@
 
 // Dolphin OS interrupt numbers (__OSInterrupt)
 enum {
+    IRQ_EXI0_EXI = 9,
+    IRQ_EXI0_TC = 10,
+    IRQ_EXI0_EXT = 11,
     IRQ_DSP_AI = 5,
     IRQ_DSP_ARAM = 6,
     IRQ_DSP_DSP = 7,
@@ -18,6 +21,10 @@ enum {
 };
 
 void hle_irq_raise(int n);
+// Calls guest function fn(r3, r4, r5) at the next interrupt delivery point.
+void hle_defer_call(uint32_t fn, uint32_t r3, uint32_t r4, uint32_t r5);
+// Address of a translated guest function by name (0 if unknown).
+uint32_t hle_find_function(const char* name);
 int hle_irq_deliver(PPCContext* ctx);
 int hle_irq_pending(void);
 int hle_irq_active(void);
